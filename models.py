@@ -282,13 +282,51 @@ class ModelWrapper:
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
     ) -> Tuple:
+        """Original generate_latent_batch for backward compatibility."""
+        past, _ = self.generate_latent_batch_with_tokens(
+            input_ids,
+            attention_mask=attention_mask,
+            latent_steps=latent_steps,
+            past_key_values=past_key_values,
+            max_latent_steps=latent_steps,
+        )
+        return past
+
+    @torch.no_grad()
+    def generate_latent_batch_with_tokens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        latent_steps: Optional[int] = None,
+        past_key_values: Optional[Tuple] = None,
+        max_latent_steps: int = 256,
+    ) -> Tuple[Tuple, List[List[int]]]:
+        """
+        Generate latent representations while also decoding tokens at each step.
+        
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            attention_mask: Attention mask
+            latent_steps: Fixed number of latent steps. If None, continue until EOS.
+            past_key_values: Optional existing KV cache
+            max_latent_steps: Maximum steps when latent_steps is None
+            
+        Returns:
+            Tuple of:
+            - past_key_values: Updated KV cache
+            - generated_token_ids: List of token ID lists for each batch item
+        """
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
 
+        batch_size = input_ids.shape[0]
+        device = self.device
+        
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=self.device)
+            attention_mask = torch.ones_like(input_ids, device=device)
         else:
-            attention_mask = attention_mask.to(self.device)
+            attention_mask = attention_mask.to(device)
 
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
@@ -309,32 +347,50 @@ class ModelWrapper:
             return_dict=True,
         )
         past = outputs.past_key_values
+        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
 
-        e_t = outputs.hidden_states[0][:, -1, :]          # [B, D]
-        last_hidden = outputs.hidden_states[-1][:, -1, :] # [B, D]
-        h_t = last_hidden.detach().clone()
+        # Get lm_head for token decoding
+        lm_head = self.model.lm_head if hasattr(self.model, 'lm_head') else self.model.get_output_embeddings()
+        eos_token_id = self.tokenizer.eos_token_id
+        
+        # Track generated tokens and completion status per batch item
+        generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
+        finished = [False] * batch_size
+        
+        # Determine number of steps
+        use_dynamic_stop = (latent_steps is None)
+        num_steps = max_latent_steps if use_dynamic_stop else latent_steps
 
-        e_t_plus_1 = None
-        latent_vecs_all: List[torch.Tensor] = []
-        latent_vecs_all.append(e_t.detach().clone())
+        for step in range(num_steps):
+            # Decode token from current hidden state (just a matrix multiply)
+            logits = lm_head(last_hidden)  # [B, vocab_size]
+            token_ids = logits.argmax(dim=-1)  # [B]
+            
+            # Record tokens and check EOS
+            all_finished = True
+            for b in range(batch_size):
+                if not finished[b]:
+                    tid = token_ids[b].item()
+                    generated_tokens[b].append(tid)
+                    if use_dynamic_stop and tid == eos_token_id:
+                        finished[b] = True
+                if not finished[b]:
+                    all_finished = False
+            
+            # Early exit if all sequences finished
+            if use_dynamic_stop and all_finished:
+                break
 
-        for step in range(latent_steps):
-
+            # Apply latent realignment and continue
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
             latent_vec = self._apply_latent_realignment(last_hidden, source_model)
-
-            latent_vecs_all.append(latent_vec.detach().clone())
-
-            if step == 0:
-                e_t_plus_1 = latent_vec.detach().clone()
-            
             latent_embed = latent_vec.unsqueeze(1)
 
             past_len = _past_length(past)
             latent_mask = torch.ones(
                 (latent_embed.shape[0], past_len + 1),
                 dtype=torch.long,
-                device=self.device,
+                device=device,
             )
             outputs = self.model(
                 inputs_embeds=latent_embed,
@@ -347,7 +403,7 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
-        return past
+        return past, generated_tokens
     
     @torch.no_grad()
     def generate_latent_batch_hidden_state(
@@ -413,4 +469,141 @@ class ModelWrapper:
             curr_output_embedding.append(latent_embed.detach())
 
         return past, torch.cat(curr_output_embedding, dim=1) # Output input embeddings
+
+    # ==================== API-friendly methods ====================
+    
+    @torch.no_grad()
+    def generate_latent_for_api(
+        self,
+        prompt: str,
+        *,
+        latent_steps: Optional[int] = None,
+        past_key_values: Optional[Tuple] = None,
+        add_think_token: bool = False,
+        max_latent_steps: int = 256,
+        debug_max_tokens: Optional[int] = None,
+        debug_continuation_prompt: Optional[str] = None,
+    ) -> Tuple[Tuple, str, int, List[int]]:
+        """
+        Generate latent representations for API usage.
+        
+        Args:
+            prompt: The text prompt (already formatted with chat template)
+            latent_steps: Number of latent reasoning steps. If None, continue until EOS.
+            past_key_values: Optional existing KV cache to extend
+            add_think_token: Whether to append <think> token
+            max_latent_steps: Maximum steps when latent_steps is None
+            debug_max_tokens: Max tokens to generate for debug output
+            debug_continuation_prompt: Prompt to use for debug text generation. If None, uses empty/space.
+            
+        Returns:
+            Tuple of:
+            - Updated past_key_values (KV cache)
+            - Generated text (actual model continuation using KV cache, for debugging)
+            - Number of latent steps actually taken
+            - Raw token IDs from latent steps (for debugging)
+        """
+        if add_think_token:
+            prompt = f"{prompt}<think>"
+        
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+        
+        new_past_kv, generated_token_ids = self.generate_latent_batch_with_tokens(
+            input_ids,
+            attention_mask=attention_mask,
+            latent_steps=latent_steps,
+            past_key_values=past_key_values,
+            max_latent_steps=max_latent_steps,
+        )
+        
+        # Get actual number of steps (tokens generated)
+        actual_steps = len(generated_token_ids[0])
+        
+
+        if debug_max_tokens and debug_max_tokens > 0:
+            # Generate readable debug text using the accumulated KV cache
+            # Use the provided continuation prompt or default to empty/space
+            continuation_text = debug_continuation_prompt if debug_continuation_prompt is not None else ""
+            
+            debug_input_ids = self.tokenizer.encode(
+                continuation_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).to(self.device)
+            
+            # If empty string produces no tokens, use a single space
+            if debug_input_ids.shape[1] == 0:
+                debug_input_ids = torch.tensor([[self.tokenizer.encode(" ", add_special_tokens=False)[0]]], device=self.device)
+            
+            debug_attention_mask = torch.ones_like(debug_input_ids)
+            
+            # Generate debug text (don't save the returned KV cache)
+            debug_texts, _ = self.generate_text_batch(
+                debug_input_ids,
+                debug_attention_mask,
+                max_new_tokens=debug_max_tokens,
+                temperature=0.7,
+                top_p=0.95,
+                past_key_values=new_past_kv,  # Use the latent-accumulated KV cache
+            )
+            debug_text = debug_texts[0].strip() if debug_texts else ""
+        else:
+            debug_text = None
+        
+        return new_past_kv, debug_text, actual_steps, generated_token_ids[0]
+    
+    @torch.no_grad()
+    def generate_text_for_api(
+        self,
+        prompt: str,
+        *,
+        past_key_values: Optional[Tuple] = None,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        add_think_token: bool = False,
+    ) -> str:
+        """
+        Generate text for API usage, optionally using cached KV values.
+        
+        Args:
+            prompt: The text prompt (already formatted with chat template)
+            past_key_values: Optional KV cache from previous latent generations
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            add_think_token: Whether to append <think> token
+            
+        Returns:
+            Generated text string
+        """
+        if add_think_token:
+            prompt = f"{prompt}<think>"
+        
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+        
+        generated_batch, _ = self.generate_text_batch(
+            input_ids,
+            attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            past_key_values=past_key_values,
+        )
+        
+        return generated_batch[0].strip()
 
