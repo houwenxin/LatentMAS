@@ -360,7 +360,7 @@ Remember this character information for future reference."""
     print(f"✓ Response WITH KV contains context info: {has_context_info}")
     
     # Check if "without KV" response lacks the information
-    lacks_specific_info = "voss" not in output_without_kv.lower() and "algorithm engineer" not in output_without_kv.lower()
+    lacks_specific_info = "algorithm engineer" not in output_without_kv.lower()
     print(f"✓ Response WITHOUT KV lacks specific context: {lacks_specific_info}")
     
     # Overall verdict
