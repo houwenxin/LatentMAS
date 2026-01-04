@@ -10,11 +10,14 @@ OpenAI-compatible API with latent multi-agent reasoning support.
 # Install dependencies
 pip install -r requirements.txt
 
-# Start server with default model
-python server.py --model_name Qwen/Qwen2.5-7B-Instruct --device cuda:0
+# Start server with default model on single device
+python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0
+
+# With multiple devices (load balancing across GPUs)
+python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0,cuda:1,cuda:2
 
 # With latent space realignment (recommended for better quality)
-python server.py --model_name Qwen/Qwen2.5-7B-Instruct --latent_space_realign
+python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0 --latent_space_realign
 ```
 
 ### Server Arguments
@@ -22,7 +25,7 @@ python server.py --model_name Qwen/Qwen2.5-7B-Instruct --latent_space_realign
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--model_name` | `Qwen/Qwen2.5-7B-Instruct` | HuggingFace model name or path |
-| `--device` | `cuda:0` | Device to run model on |
+| `--devices` | `cuda:0` | Comma-separated list of devices for load balancing (e.g., `cuda:0,cuda:1`) |
 | `--latent_steps` | `10` | Default latent reasoning steps |
 | `--cache_ttl` | `1800` | Session cache TTL in seconds (30 min) |
 | `--host` | `0.0.0.0` | Host to bind to |
@@ -206,7 +209,54 @@ Health check endpoint.
 
 ```bash
 curl http://localhost:8000/health
-# {"status": "healthy", "model_loaded": true, "active_sessions": 5}
+# {"status": "healthy", "model_loaded": true, "devices": ["cuda:0", "cuda:1"], "active_sessions": 5}
+```
+
+---
+
+## Multi-Device Support
+
+The API supports loading the model on multiple GPUs for automatic load balancing using round-robin scheduling.
+
+### Configuration
+
+```bash
+# Single device (default)
+python server.py --devices cuda:0
+
+# Multiple GPUs - requests are distributed round-robin
+python server.py --devices cuda:0,cuda:1,cuda:2,cuda:3
+
+# Mix CPU and GPU
+python server.py --devices cuda:0,cpu
+```
+
+### Behavior
+
+- **Load Balancing**: Each incoming request is assigned to the next available device in round-robin order
+- **Session Affinity**: Sessions (KV cache) are device-independent - any device can use cached KV values from previous calls
+- **Memory Efficiency**: Each device loads a separate model instance, so memory usage scales linearly with the number of devices
+- **Fault Tolerance**: If one device fails, other devices continue serving requests (requires restart to recover failed device)
+
+### Example
+
+```python
+# Server started with: --devices cuda:0,cuda:1
+
+# Request 1 → cuda:0
+# Request 2 → cuda:1  
+# Request 3 → cuda:0
+# Request 4 → cuda:1
+# ...and so on
+```
+
+### Monitoring
+
+Check active devices via health endpoint:
+
+```bash
+curl http://localhost:8000/health
+# Returns: {"devices": ["cuda:0", "cuda:1"], ...}
 ```
 
 ---

@@ -9,7 +9,8 @@ Provides a /v1/chat/completions endpoint with three modes:
 
 import argparse
 import uuid
-from typing import List, Optional, Literal
+import itertools
+from typing import List, Optional, Literal, Dict
 from contextlib import asynccontextmanager
 
 import torch
@@ -101,9 +102,18 @@ class ChatCompletionResponse(BaseModel):
 
 # ==================== Global State ====================
 
-model_wrapper: Optional[ModelWrapper] = None
+model_wrappers: Dict[str, ModelWrapper] = {}  # device -> ModelWrapper
+device_pool: Optional[itertools.cycle] = None  # Round-robin device selector
 cache_manager: Optional[CacheManager] = None
 default_latent_steps: int = 10
+
+
+# ==================== Helper Functions ====================
+
+def get_model_wrapper() -> ModelWrapper:
+    """Get next available model wrapper using round-robin load balancing."""
+    device = next(device_pool)
+    return model_wrappers[device]
 
 
 # ==================== Lifespan ====================
@@ -111,14 +121,14 @@ default_latent_steps: int = 10
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize model and cache manager on startup."""
-    global model_wrapper, cache_manager, default_latent_steps
+    global model_wrappers, device_pool, cache_manager, default_latent_steps
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="LatentMAS API Server")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct",
                         help="Model name or path")
-    parser.add_argument("--device", type=str, default="cuda:0",
-                        help="Device to run model on")
+    parser.add_argument("--devices", type=str, default="cuda:0",
+                        help="Comma-separated list of devices (e.g., 'cuda:0,cuda:1,cuda:2')")
     parser.add_argument("--latent_steps", type=int, default=10,
                         help="Default latent reasoning steps")
     parser.add_argument("--cache_ttl", type=int, default=1800,
@@ -133,31 +143,39 @@ async def lifespan(app: FastAPI):
     args, _ = parser.parse_known_args()
     
     default_latent_steps = args.latent_steps
+    devices = [d.strip() for d in args.devices.split(',')]
     
     print(f"[API] Loading model: {args.model_name}")
-    print(f"[API] Device: {args.device}")
+    print(f"[API] Devices: {devices}")
     print(f"[API] Default latent steps: {args.latent_steps}")
     
-    # Create a minimal args namespace for ModelWrapper
-    model_args = argparse.Namespace(
-        latent_space_realign=args.latent_space_realign,
-        device=args.device,
-        device2=args.device,  # Same device for HF model
-        use_second_HF_model=False,
-        enable_prefix_caching=False,
-        method="latent_mas",
-    )
+    # Load model on each device
+    for device in devices:
+        print(f"[API] Loading model on {device}...")
+        
+        # Create a minimal args namespace for ModelWrapper
+        model_args = argparse.Namespace(
+            latent_space_realign=args.latent_space_realign,
+            device=device,
+            device2=device,  # Same device for HF model
+            use_second_HF_model=False,
+            enable_prefix_caching=False,
+            method="latent_mas",
+        )
+        
+        model_wrappers[device] = ModelWrapper(
+            model_name=args.model_name,
+            device=torch.device(device),
+            use_vllm=False,  # Use HF backend for API
+            args=model_args,
+        )
     
-    model_wrapper = ModelWrapper(
-        model_name=args.model_name,
-        device=torch.device(args.device),
-        use_vllm=False,  # Use HF backend for API
-        args=model_args,
-    )
+    # Create round-robin device selector
+    device_pool = itertools.cycle(devices)
     
     cache_manager = get_cache_manager(ttl_seconds=args.cache_ttl)
     
-    print(f"[API] Server ready!")
+    print(f"[API] Server ready with {len(devices)} device(s)!")
     
     yield
     
@@ -189,12 +207,12 @@ app.add_middleware(
 def build_prompt_from_messages(messages: List[Message]) -> str:
     """Convert messages to chat prompt using model's chat template."""
     message_dicts = [{"role": m.role, "content": m.content} for m in messages]
-    return model_wrapper.render_chat(message_dicts, add_generation_prompt=True)
+    return get_model_wrapper().render_chat(message_dicts, add_generation_prompt=True)
 
 
 def count_tokens(text: str) -> int:
     """Count tokens in text."""
-    return len(model_wrapper.tokenizer.encode(text, add_special_tokens=False))
+    return len(get_model_wrapper().tokenizer.encode(text, add_special_tokens=False))
 
 
 # ==================== Endpoints ====================
@@ -209,7 +227,7 @@ async def chat_completions(request: ChatCompletionRequest):
     - latent: Generate latent representations and cache KV values
     - text: Generate text using cached KV values from previous latent calls
     """
-    if model_wrapper is None:
+    if not model_wrappers:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     # Build prompt from messages
@@ -220,6 +238,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     if request.mode == "normal":
         # Standard generation - no latent, no cache
+        model_wrapper = get_model_wrapper()
         generated_text = model_wrapper.generate_text_for_api(
             prompt,
             past_key_values=None,
@@ -264,6 +283,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
         
         # Generate new latent representations with debug text output
+        model_wrapper = get_model_wrapper()
         new_past_kv, debug_text, actual_steps, raw_token_ids = model_wrapper.generate_latent_for_api(
             prompt,
             latent_steps=latent_steps,
@@ -326,6 +346,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 detail=f"Session '{request.session_id}' not found or expired"
             )
         
+        model_wrapper = get_model_wrapper()
         generated_text = model_wrapper.generate_text_for_api(
             prompt,
             past_key_values=past_kv,
@@ -384,7 +405,8 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "model_loaded": model_wrapper is not None,
+        "model_loaded": len(model_wrappers) > 0,
+        "devices": list(model_wrappers.keys()),
         "active_sessions": cache_manager.size() if cache_manager else 0,
     }
 
