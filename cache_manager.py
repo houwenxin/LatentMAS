@@ -10,9 +10,10 @@ import threading
 from typing import Dict, Optional, Tuple, Any, Union
 import torch
 try:
-    from transformers.cache_utils import Cache
+    from transformers.cache_utils import Cache, DynamicCache
 except ImportError:
     Cache = None
+    DynamicCache = None
 
 def _move_kv_to_device(past_key_values: Tuple, device: Union[str, torch.device]) -> Tuple:
     """
@@ -159,6 +160,12 @@ class CacheManager:
         
         # Migrate from CPU to GPU (outside lock to avoid blocking other operations)
         past_kv_gpu = _move_kv_to_device(past_kv_cpu, device)
+        
+        # Convert back to DynamicCache for modern transformers models (e.g., Qwen3)
+        # that expect Cache objects with get_seq_length() method
+        if DynamicCache is not None and isinstance(past_kv_gpu, tuple):
+            past_kv_gpu = DynamicCache.from_legacy_cache(past_kv_gpu)
+        
         return past_kv_gpu
     
     def update(self, session_id: str, past_key_values: Tuple) -> bool:

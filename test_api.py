@@ -1581,7 +1581,7 @@ if __name__ == "__main__":
         # Run tests
         # test_health()
         # test_normal_mode()
-        # test_latent_sequential()
+        test_latent_sequential()
         # test_latent_dynamic()
         # test_session_management()
         test_kv_injection_ablation()  # NEW: Verify KV injection is working

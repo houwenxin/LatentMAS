@@ -23,9 +23,15 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
 
-def _past_length(past_key_values: Optional[Tuple]) -> int:
+def _past_length(past_key_values) -> int:
     if not past_key_values:
         return 0
+    
+    # Handle Cache objects (DynamicCache, etc.)
+    if Cache is not None and isinstance(past_key_values, Cache):
+        return past_key_values.get_seq_length()
+    
+    # Handle legacy tuple format
     k = past_key_values[0][0]
     return k.shape[-2]
 
