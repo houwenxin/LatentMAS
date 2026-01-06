@@ -22,6 +22,52 @@ from models import ModelWrapper
 from cache_manager import get_cache_manager, CacheManager
 
 
+# ==================== Helper Functions ====================
+
+def detect_attention_implementation(model_wrapper: ModelWrapper) -> str:
+    """Detect which attention implementation is being used by the model.
+    
+    Returns one of: 'flash_attention_2', 'sdpa', 'eager', 'vllm', or 'unknown'
+    """
+    if model_wrapper.use_vllm:
+        return 'vllm'
+    
+    # Check transformers model config
+    model = getattr(model_wrapper, 'model', None)
+    if model is None:
+        model = getattr(model_wrapper, 'HF_model', None)
+    
+    if model is None:
+        return 'unknown'
+    
+    # Try to get attention implementation from model config
+    config = getattr(model, 'config', None)
+    if config is not None:
+        attn_impl = getattr(config, '_attn_implementation', None)
+        if attn_impl is not None:
+            return attn_impl
+        
+        # Some models store it differently
+        attn_impl = getattr(config, 'attn_implementation', None)
+        if attn_impl is not None:
+            return attn_impl
+    
+    # Fallback: check if flash-attn is available and model supports it
+    try:
+        import flash_attn
+        # If flash_attn is installed and no explicit implementation is set,
+        # transformers will try to use it by default on supported models
+        return 'flash_attention_2 (inferred)'
+    except ImportError:
+        pass
+    
+    # Default for transformers without flash-attn is usually SDPA or eager
+    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        return 'sdpa (inferred)'
+    
+    return 'eager (fallback)'
+
+
 # ==================== Request/Response Models ====================
 
 class Message(BaseModel):
@@ -65,6 +111,18 @@ class ChatCompletionRequest(BaseModel):
     
     # Optional: enable thinking token for reasoning models
     add_think_token: bool = Field(default=False, description="Add <think> token for reasoning models")
+    
+    # Latent space realignment
+    latent_space_realign: bool = Field(
+        default=False,
+        description="Enable latent space realignment for better quality latent representations (only for 'latent' mode)"
+    )
+    
+    # Latent only mode
+    latent_only: bool = Field(
+        default=False,
+        description="Skip debug text generation in latent mode, only generate and cache KV values"
+    )
 
 
 class Choice(BaseModel):
@@ -82,6 +140,10 @@ class Usage(BaseModel):
         default=None,
         description="Number of latent reasoning steps taken (only for 'latent' mode)"
     )
+    kv_cache_shape: Optional[List[int]] = Field(
+        default=None,
+        description="Shape of KV cache tensors [batch, heads, seq_len, head_dim] (only for 'latent' mode)"
+    )
 
 
 class ChatCompletionResponse(BaseModel):
@@ -98,6 +160,29 @@ class ChatCompletionResponse(BaseModel):
         default=None,
         description="Session ID for cached KV values (returned in latent/text modes)"
     )
+
+
+# ==================== Helper Functions ====================
+
+def get_kv_cache_shape(past_key_values) -> Optional[List[int]]:
+    """Extract shape [batch, heads, seq_len, head_dim] from first layer's key tensor."""
+    if past_key_values is None:
+        return None
+    
+    # Handle DynamicCache objects from transformers
+    try:
+        from transformers.cache_utils import Cache
+        if isinstance(past_key_values, Cache):
+            past_key_values = past_key_values.to_legacy_cache()
+    except ImportError:
+        pass
+    
+    if past_key_values and len(past_key_values) > 0:
+        first_layer = past_key_values[0]
+        if first_layer and len(first_layer) > 0:
+            key_tensor = first_layer[0]  # First layer's key tensor
+            return list(key_tensor.shape)
+    return None
 
 
 # ==================== Global State ====================
@@ -129,7 +214,7 @@ async def lifespan(app: FastAPI):
                         help="Model name or path")
     parser.add_argument("--devices", type=str, default="cuda:0",
                         help="Comma-separated list of devices (e.g., 'cuda:0,cuda:1,cuda:2')")
-    parser.add_argument("--latent_steps", type=int, default=10,
+    parser.add_argument("--latent_steps", type=int, default=None,
                         help="Default latent reasoning steps")
     parser.add_argument("--cache_ttl", type=int, default=1800,
                         help="Cache TTL in seconds (default 30 minutes)")
@@ -137,8 +222,6 @@ async def lifespan(app: FastAPI):
                         help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000,
                         help="Port to bind to")
-    parser.add_argument("--latent_space_realign", action="store_true",
-                        help="Enable latent space realignment")
     
     args, _ = parser.parse_known_args()
     
@@ -155,7 +238,7 @@ async def lifespan(app: FastAPI):
         
         # Create a minimal args namespace for ModelWrapper
         model_args = argparse.Namespace(
-            latent_space_realign=args.latent_space_realign,
+            latent_space_realign=False,  # Per-request parameter, always build both matrices at startup
             device=device,
             device2=device,  # Same device for HF model
             use_second_HF_model=False,
@@ -169,6 +252,10 @@ async def lifespan(app: FastAPI):
             use_vllm=False,  # Use HF backend for API
             args=model_args,
         )
+        
+        # Detect and log attention implementation
+        attn_impl = detect_attention_implementation(model_wrappers[device])
+        print(f"[API] Attention implementation on {device}: {attn_impl}")
     
     # Create round-robin device selector
     device_pool = itertools.cycle(devices)
@@ -274,8 +361,9 @@ async def chat_completions(request: ChatCompletionRequest):
         
         # Load existing cache if session_id provided
         past_kv = None
+        model_wrapper = get_model_wrapper()
         if request.session_id:
-            past_kv = cache_manager.get(request.session_id)
+            past_kv = cache_manager.get(request.session_id, device=str(model_wrapper.device))
             if past_kv is None:
                 raise HTTPException(
                     status_code=404,
@@ -283,15 +371,16 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
         
         # Generate new latent representations with debug text output
-        model_wrapper = get_model_wrapper()
         new_past_kv, debug_text, actual_steps, raw_token_ids = model_wrapper.generate_latent_for_api(
             prompt,
             latent_steps=latent_steps,
             past_key_values=past_kv,
             add_think_token=request.add_think_token,
             max_latent_steps=request.max_tokens,  # Use max_tokens as max latent steps
-            debug_max_tokens=request.debug_max_tokens if request.debug_max_tokens is not None else 50,
+            debug_max_tokens=request.debug_max_tokens,
             debug_continuation_prompt=request.debug_continuation_prompt,
+            latent_space_realign=request.latent_space_realign,
+            latent_only=request.latent_only,
         )
         
         # Store/update cache
@@ -327,6 +416,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 completion_tokens=actual_steps + debug_tokens,
                 total_tokens=prompt_tokens + actual_steps + debug_tokens,
                 latent_steps=actual_steps,
+                kv_cache_shape=get_kv_cache_shape(new_past_kv),
             ),
             session_id=session_id,
         )
@@ -339,14 +429,14 @@ async def chat_completions(request: ChatCompletionRequest):
                 detail="session_id is required for 'text' mode"
             )
         
-        past_kv = cache_manager.get(request.session_id)
+        model_wrapper = get_model_wrapper()
+        past_kv = cache_manager.get(request.session_id, device=str(model_wrapper.device))
         if past_kv is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Session '{request.session_id}' not found or expired"
             )
         
-        model_wrapper = get_model_wrapper()
         generated_text = model_wrapper.generate_text_for_api(
             prompt,
             past_key_values=past_kv,

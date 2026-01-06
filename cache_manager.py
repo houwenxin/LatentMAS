@@ -7,7 +7,42 @@ Manages server-side storage of KV caches with TTL expiration.
 import time
 import uuid
 import threading
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, Union
+import torch
+try:
+    from transformers.cache_utils import Cache
+except ImportError:
+    Cache = None
+
+def _move_kv_to_device(past_key_values: Tuple, device: Union[str, torch.device]) -> Tuple:
+    """
+    Move KV cache tensors to specified device.
+    Handles both Cache objects (DynamicCache) and legacy tuple format.
+    
+    Args:
+        past_key_values: Cache object or nested tuple structure
+        device: Target device (e.g., 'cpu', 'cuda:0')
+        
+    Returns:
+        KV cache with all tensors moved to target device (always as legacy tuple format for storage)
+    """
+    if past_key_values is None:
+        return None
+    
+    # Handle Cache objects (DynamicCache, etc.)
+    if Cache is not None and isinstance(past_key_values, Cache):
+        # Convert to legacy format, move tensors, keep as legacy for CPU storage
+        legacy = past_key_values.to_legacy_cache()
+        return tuple(
+            tuple(tensor.to(device) for tensor in layer)
+            for layer in legacy
+        )
+    
+    # Handle legacy tuple format
+    return tuple(
+        tuple(tensor.to(device) for tensor in layer)
+        for layer in past_key_values
+    )
 
 
 class CacheManager:
@@ -73,7 +108,7 @@ class CacheManager:
         Create a new cache entry.
         
         Args:
-            past_key_values: The KV cache to store
+            past_key_values: The KV cache to store (will be moved to CPU)
             session_id: Optional custom session ID. If None, UUID is generated.
             
         Returns:
@@ -82,24 +117,31 @@ class CacheManager:
         if session_id is None:
             session_id = str(uuid.uuid4())
         
+        # Move KV cache to CPU to save GPU memory
+        past_kv_cpu = _move_kv_to_device(past_key_values, 'cpu')
+        
         now = time.time()
         with self._lock:
             self._cache[session_id] = {
-                "past_key_values": past_key_values,
+                "past_key_values": past_kv_cpu,
                 "created_at": now,
                 "last_accessed": now,
             }
         
         return session_id
     
-    def get(self, session_id: str) -> Optional[Tuple]:
+    def get(self, session_id: str, device: Union[str, torch.device] = 'cuda:0') -> Optional[Tuple]:
         """
-        Retrieve KV cache by session ID.
+        Retrieve KV cache by session ID and migrate to target device.
         
         Updates last_accessed timestamp on access.
         
+        Args:
+            session_id: Session identifier
+            device: Target device to move KV cache to (default: 'cuda:0')
+        
         Returns:
-            The past_key_values tuple, or None if not found/expired
+            The past_key_values tuple moved to target device, or None if not found/expired
         """
         with self._lock:
             entry = self._cache.get(session_id)
@@ -113,20 +155,30 @@ class CacheManager:
             
             # Update access time
             entry["last_accessed"] = time.time()
-            return entry["past_key_values"]
+            past_kv_cpu = entry["past_key_values"]
+        
+        # Migrate from CPU to GPU (outside lock to avoid blocking other operations)
+        past_kv_gpu = _move_kv_to_device(past_kv_cpu, device)
+        return past_kv_gpu
     
     def update(self, session_id: str, past_key_values: Tuple) -> bool:
         """
         Update existing cache entry.
         
+        Args:
+            past_key_values: The KV cache to store (will be moved to CPU)
+        
         Returns:
             True if updated, False if session not found
         """
+        # Move KV cache to CPU to save GPU memory
+        past_kv_cpu = _move_kv_to_device(past_key_values, 'cpu')
+        
         with self._lock:
             if session_id not in self._cache:
                 return False
             
-            self._cache[session_id]["past_key_values"] = past_key_values
+            self._cache[session_id]["past_key_values"] = past_kv_cpu
             self._cache[session_id]["last_accessed"] = time.time()
             return True
     

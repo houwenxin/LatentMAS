@@ -4,7 +4,10 @@ import torch
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+try:
+    from transformers.cache_utils import Cache
+except ImportError:
+    Cache = None
 try:
     from vllm import LLM, SamplingParams
     _HAS_VLLM = True
@@ -41,7 +44,7 @@ class ModelWrapper:
         self.pre_aligned = None
 
         if self.use_vllm:
-            
+            raise NotImplementedError("vLLM backend with ModelWrapper is not fully implemented yet.")
             tp_size = max(1, int(getattr(args, "tensor_parallel_size", 1)))
             gpu_util = float(getattr(args, "gpu_memory_utilization", 0.9))
             
@@ -54,10 +57,25 @@ class ModelWrapper:
             
             use_second_hf = bool(getattr(args, "use_second_HF_model", False)) if args else False
             if use_second_hf:
-                self.HF_model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-                ).to(args.device2).eval() 
+                # Try to use flash_attention_2 if available, fallback to auto
+                try:
+                    self.HF_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                        device_map={"": device2},
+                        low_cpu_mem_usage=True,
+                        attn_implementation="flash_attention_2",
+                    ).eval()
+                    print(f"[ModelWrapper] Loaded HF model with flash_attention_2")
+                except Exception as e:
+                    print(f"[ModelWrapper] Could not load with flash_attention_2: {e}")
+                    print(f"[ModelWrapper] Falling back to default attention implementation")
+                    self.HF_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                    ).eval()
                 self.embedding_layer = self.HF_model.get_input_embeddings()
                 self.HF_device = args.device2
                 # if self.latent_space_realign:
@@ -71,19 +89,40 @@ class ModelWrapper:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
         with torch.no_grad():
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-            )
+            # Try to use flash_attention_2 if available, fallback to auto
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                    device_map={"": device},
+                    low_cpu_mem_usage=True,
+                    attn_implementation="flash_attention_2",
+                )
+                print(f"[ModelWrapper] Loaded model with flash_attention_2")
+            except Exception as e:
+                print(f"[ModelWrapper] Could not load with flash_attention_2: {e}")
+                print(f"[ModelWrapper] Falling back to default attention implementation")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                    device_map={"": device},
+                    low_cpu_mem_usage=True,
+                )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
-        self.model.to(device)
+        # self.model.to(device)
         self.model.eval()
         if hasattr(self.model.config, "use_cache"):
             self.model.config.use_cache = True
         if self.latent_space_realign:
             self._ensure_latent_realign_matrix(self.model, self.device, args)
 
+        # Diagnostic: Check actual device placement
+        print(f"[ModelWrapper] Model device map: {self.model.hf_device_map if hasattr(self.model, 'hf_device_map') else 'N/A'}")
+        print(f"[ModelWrapper] First parameter device: {next(self.model.parameters()).device}")
+        print(f"[ModelWrapper] lm_head device: {self.model.lm_head.weight.device if hasattr(self.model, 'lm_head') else 'N/A'}")
+        print(f"[ModelWrapper] Embedding device: {self.model.get_input_embeddings().weight.device}")
+        
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
@@ -175,34 +214,34 @@ class ModelWrapper:
         rhs = torch.matmul(output_weight.T, input_weight)
         realign_matrix = torch.linalg.solve(gram, rhs)
         target_norm = input_weight.norm(dim=1).mean().detach()
+        
+        # Build identity matrix for non-realign case
+        identity_matrix = torch.eye(realign_matrix.shape[0], device=realign_matrix.device, dtype=realign_matrix.dtype)
 
-        if self.args.latent_space_realign:
-            pass
-        else:
-            # keep the matrix, for further normalization
-            realign_matrix = torch.eye(realign_matrix.shape[0], device=realign_matrix.device, dtype=realign_matrix.dtype)
+        return realign_matrix, identity_matrix, target_norm
 
-        return realign_matrix, target_norm
-
-    def _ensure_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _ensure_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         key = id(model)
         info = self._latent_realign_matrices.get(key)
         target_device = torch.device(device)
 
         if info is None:
-            matrix, target_norm = self._build_latent_realign_matrix(model, target_device, args)
+            realign_matrix, identity_matrix, target_norm = self._build_latent_realign_matrix(model, target_device, args)
         else:
-            matrix, target_norm = info
-            if matrix.device != target_device:
-                matrix = matrix.to(target_device)
+            realign_matrix, identity_matrix, target_norm = info
+            if realign_matrix.device != target_device:
+                realign_matrix = realign_matrix.to(target_device)
+                identity_matrix = identity_matrix.to(target_device)
 
-        target_norm = target_norm.to(device=target_device, dtype=matrix.dtype) if isinstance(target_norm, torch.Tensor) else torch.as_tensor(target_norm, device=target_device, dtype=matrix.dtype)
-        self._latent_realign_matrices[key] = (matrix, target_norm)
+        target_norm = target_norm.to(device=target_device, dtype=realign_matrix.dtype) if isinstance(target_norm, torch.Tensor) else torch.as_tensor(target_norm, device=target_device, dtype=realign_matrix.dtype)
+        self._latent_realign_matrices[key] = (realign_matrix, identity_matrix, target_norm)
 
-        return matrix, target_norm
+        return realign_matrix, identity_matrix, target_norm
 
-    def _apply_latent_realignment(self, hidden: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
-        matrix, target_norm = self._ensure_latent_realign_matrix(model, hidden.device, self.args)
+    def _apply_latent_realignment(self, hidden: torch.Tensor, model: torch.nn.Module, latent_space_realign: bool = False) -> torch.Tensor:
+        realign_matrix, identity_matrix, target_norm = self._ensure_latent_realign_matrix(model, hidden.device, self.args)
+        # Choose the appropriate matrix based on the per-request flag
+        matrix = realign_matrix if latent_space_realign else identity_matrix
         hidden_fp32 = hidden.to(torch.float32)
         aligned = torch.matmul(hidden_fp32, matrix)
 
@@ -301,6 +340,7 @@ class ModelWrapper:
         latent_steps: Optional[int] = None,
         past_key_values: Optional[Tuple] = None,
         max_latent_steps: int = 256,
+        latent_space_realign: bool = False,
     ) -> Tuple[Tuple, List[List[int]]]:
         """
         Generate latent representations while also decoding tokens at each step.
@@ -311,6 +351,7 @@ class ModelWrapper:
             latent_steps: Fixed number of latent steps. If None, continue until EOS.
             past_key_values: Optional existing KV cache
             max_latent_steps: Maximum steps when latent_steps is None
+            latent_space_realign: Whether to apply latent space realignment
             
         Returns:
             Tuple of:
@@ -383,7 +424,7 @@ class ModelWrapper:
 
             # Apply latent realignment and continue
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
-            latent_vec = self._apply_latent_realignment(last_hidden, source_model)
+            latent_vec = self._apply_latent_realignment(last_hidden, source_model, latent_space_realign)
             latent_embed = latent_vec.unsqueeze(1)
 
             past_len = _past_length(past)
@@ -447,7 +488,7 @@ class ModelWrapper:
         for _ in range(latent_steps):
 
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
-            latent_vec = self._apply_latent_realignment(last_hidden, source_model)
+            latent_vec = self._apply_latent_realignment(last_hidden, source_model, self.latent_space_realign)
             latent_embed = latent_vec.unsqueeze(1)
             past_len = _past_length(past)
             latent_mask = torch.ones(
@@ -471,6 +512,33 @@ class ModelWrapper:
         return past, torch.cat(curr_output_embedding, dim=1) # Output input embeddings
 
     # ==================== API-friendly methods ====================
+    @staticmethod
+    def _slice_tensor(tensor: torch.Tensor, tokens_to_keep: int) -> torch.Tensor:
+        if tokens_to_keep <= 0:
+            return tensor[..., 0:0, :].contiguous()
+        keep = min(tokens_to_keep, tensor.shape[-2])
+        start = tensor.shape[-2] - keep
+        return tensor[..., start:, :].contiguous()
+
+    def _truncate_past(self, past_kv: Optional[Tuple], tokens_to_keep: int) -> Optional[Tuple]:
+        if past_kv is None or tokens_to_keep <= 0:
+            return None
+        if Cache is not None and isinstance(past_kv, Cache):
+            legacy = past_kv.to_legacy_cache()
+            trimmed_legacy = tuple(
+                tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
+                for layer in legacy
+            )
+            return past_kv.__class__.from_legacy_cache(trimmed_legacy)
+        trimmed_layers = []
+        for layer in past_kv:
+            if isinstance(layer, tuple):
+                trimmed_layers.append(tuple(self._slice_tensor(t, tokens_to_keep) for t in layer))
+            elif torch.is_tensor(layer):
+                trimmed_layers.append(self._slice_tensor(layer, tokens_to_keep))
+            else:
+                trimmed_layers.append(layer)
+        return tuple(trimmed_layers)
     
     @torch.no_grad()
     def generate_latent_for_api(
@@ -483,6 +551,8 @@ class ModelWrapper:
         max_latent_steps: int = 256,
         debug_max_tokens: Optional[int] = None,
         debug_continuation_prompt: Optional[str] = None,
+        latent_space_realign: bool = False,
+        latent_only: bool = False,
     ) -> Tuple[Tuple, str, int, List[int]]:
         """
         Generate latent representations for API usage.
@@ -495,6 +565,7 @@ class ModelWrapper:
             max_latent_steps: Maximum steps when latent_steps is None
             debug_max_tokens: Max tokens to generate for debug output
             debug_continuation_prompt: Prompt to use for debug text generation. If None, uses empty/space.
+            latent_space_realign: Whether to apply latent space realignment
             
         Returns:
             Tuple of:
@@ -515,18 +586,27 @@ class ModelWrapper:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
         
+        prev_past_len = _past_length(past_key_values)
+        
         new_past_kv, generated_token_ids = self.generate_latent_batch_with_tokens(
             input_ids,
             attention_mask=attention_mask,
             latent_steps=latent_steps,
             past_key_values=past_key_values,
             max_latent_steps=max_latent_steps,
+            latent_space_realign=latent_space_realign,
         )
         
         # Get actual number of steps (tokens generated)
         actual_steps = len(generated_token_ids[0])
         
-
+        if latent_only:
+            new_past_len = _past_length(new_past_kv)
+            tokens_added = new_past_len - prev_past_len
+            tokens_to_keep = latent_steps if latent_only else tokens_added
+            output_past_kv = self._truncate_past(new_past_kv, tokens_to_keep)
+        else:
+            output_past_kv = new_past_kv
         if debug_max_tokens and debug_max_tokens > 0:
             # Generate readable debug text using the accumulated KV cache
             # Use the provided continuation prompt or default to empty/space
@@ -557,7 +637,7 @@ class ModelWrapper:
         else:
             debug_text = None
         
-        return new_past_kv, debug_text, actual_steps, generated_token_ids[0]
+        return output_past_kv, debug_text, actual_steps, generated_token_ids[0]
     
     @torch.no_grad()
     def generate_text_for_api(

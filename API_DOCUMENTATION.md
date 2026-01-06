@@ -15,9 +15,6 @@ python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0
 
 # With multiple devices (load balancing across GPUs)
 python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0,cuda:1,cuda:2
-
-# With latent space realignment (recommended for better quality)
-python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0 --latent_space_realign
 ```
 
 ### Server Arguments
@@ -30,7 +27,6 @@ python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0 --latent
 | `--cache_ttl` | `1800` | Session cache TTL in seconds (30 min) |
 | `--host` | `0.0.0.0` | Host to bind to |
 | `--port` | `8000` | Port to bind to |
-| `--latent_space_realign` | `False` | Enable latent space realignment |
 
 ---
 
@@ -56,8 +52,10 @@ OpenAI-compatible chat completions with LatentMAS extensions.
   "temperature": 0.7,
   "top_p": 0.95,
   "add_think_token": false,
+  "latent_space_realign": false,
   "debug_max_tokens": 50,
-  "debug_continuation_prompt": null
+  "debug_continuation_prompt": null,
+  "latent_only": false
 }
 ```
 
@@ -73,8 +71,10 @@ OpenAI-compatible chat completions with LatentMAS extensions.
 | `temperature` | `float` | No | `0.7` | Sampling temperature |
 | `top_p` | `float` | No | `0.95` | Top-p sampling |
 | `add_think_token` | `bool` | No | `false` | Append `<think>` token for reasoning models |
+| `latent_space_realign` | `bool` | No | `false` | Enable latent space realignment for better quality (only for `latent` mode) |
 | `debug_max_tokens` | `int` | No | `50` | Max tokens for debug preview in latent mode |
 | `debug_continuation_prompt` | `string` | No | `null` | Continuation prompt for debug text generation |
+| `latent_only` | `bool` | No | `false` | Whether to keep input context in KV cache |
 
 #### Response Body
 
@@ -139,6 +139,7 @@ response = requests.post(
             {"role": "user", "content": "Plan how to solve: What is 2 + 2?"}
         ],
         "latent_steps": 10,
+        "latent_space_realign": true,  # Enable for better quality
         "debug_max_tokens": 100  # Preview what model would generate
     }
 )
@@ -151,6 +152,7 @@ session_id = response.json()["session_id"]
 - Returns `session_id` for subsequent calls
 - Debug text shows what model would generate (for debugging)
 - If `latent_steps` is `null`, generates until EOS token
+- Set `latent_space_realign: true` for better quality latent representations
 
 ### Mode: `text`
 
