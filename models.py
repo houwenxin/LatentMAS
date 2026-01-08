@@ -304,11 +304,37 @@ class ModelWrapper:
         )
         sequences = outputs.sequences
         generations: List[str] = []
+        
+        print(f"[generate_text_batch] Input shape: {input_ids.shape}, max_new_tokens: {max_new_tokens}")
+        print(f"[generate_text_batch] Output sequences shape: {sequences.shape}")
+        print(f"[generate_text_batch] Prompt lengths: {prompt_lengths}")
+        
         for idx, length in enumerate(prompt_lengths):
             length = int(length)
             generated_ids = sequences[idx, length:]
+            
+            # Debug: Log generated token IDs and check for early EOS
+            eos_token_id = self.tokenizer.eos_token_id
+            num_generated = len(generated_ids)
+            eos_positions = (generated_ids == eos_token_id).nonzero(as_tuple=True)[0].tolist()
+            print(f"[generate_text_batch] Batch idx {idx}: Generated {num_generated} tokens")
+            print(f"[generate_text_batch] Batch idx {idx}: Generated token IDs (first 20): {generated_ids[:20].tolist()}")
+            if eos_positions:
+                print(f"[generate_text_batch] Batch idx {idx}: EOS found at positions: {eos_positions}")
+                if eos_positions[0] == 0:
+                    print(f"[warning][generate_text_batch] Batch idx {idx}: IMMEDIATE EOS - model hit EOS on first token!")
+            
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            
+            # Debug: Log final decoded text
+            if not text:
+                print(f"[warning][generate_text_batch] Batch idx {idx}: EMPTY TEXT after decode! Raw tokens: {generated_ids.tolist()}")
+            else:
+                print(f"[generate_text_batch] Batch idx {idx}: Decoded text length: {len(text)} chars, preview: {text[:100]!r}...")
+            
             generations.append(text)
+        
+        print(f"[generate_text_batch] Returning {len(generations)} generations, all empty: {all(not g for g in generations)}")
         return generations, outputs.past_key_values
 
     def tokenize_text(self, text: str) -> torch.Tensor:
