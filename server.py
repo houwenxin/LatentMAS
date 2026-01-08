@@ -490,6 +490,40 @@ async def list_sessions():
     return {"active_sessions": cache_manager.size()}
 
 
+@app.post("/v1/memory/cleanup")
+async def cleanup_memory():
+    """Force GPU memory cleanup. Useful for freeing cached CUDA memory."""
+    import gc
+    gc.collect()
+    
+    memory_stats = {}
+    if torch.cuda.is_available():
+        # Get memory stats before cleanup
+        for device in model_wrappers.keys():
+            device_idx = int(device.split(":")[-1]) if ":" in device else 0
+            memory_stats[device] = {
+                "before_allocated_mb": torch.cuda.memory_allocated(device_idx) / 1024 / 1024,
+                "before_reserved_mb": torch.cuda.memory_reserved(device_idx) / 1024 / 1024,
+            }
+        
+        torch.cuda.empty_cache()
+        
+        # Get memory stats after cleanup
+        for device in model_wrappers.keys():
+            device_idx = int(device.split(":")[-1]) if ":" in device else 0
+            memory_stats[device]["after_allocated_mb"] = torch.cuda.memory_allocated(device_idx) / 1024 / 1024
+            memory_stats[device]["after_reserved_mb"] = torch.cuda.memory_reserved(device_idx) / 1024 / 1024
+            memory_stats[device]["freed_mb"] = (
+                memory_stats[device]["before_reserved_mb"] - memory_stats[device]["after_reserved_mb"]
+            )
+    
+    return {
+        "status": "cleaned",
+        "active_sessions": cache_manager.size() if cache_manager else 0,
+        "memory_stats": memory_stats,
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""

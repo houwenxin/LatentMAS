@@ -4,6 +4,7 @@ KV Cache Manager for LatentMAS API
 Manages server-side storage of KV caches with TTL expiration.
 """
 
+import gc
 import time
 import uuid
 import threading
@@ -102,6 +103,12 @@ class CacheManager:
             for key in expired_keys:
                 del self._cache[key]
         
+        # Force GPU memory release after deleting cached tensors
+        if expired_keys:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         return len(expired_keys)
     
     def create(self, past_key_values: Tuple, session_id: Optional[str] = None) -> str:
@@ -152,6 +159,10 @@ class CacheManager:
             # Check TTL
             if time.time() - entry["last_accessed"] > self._ttl:
                 del self._cache[session_id]
+                # Force GPU memory release
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 return None
             
             # Update access time
@@ -196,11 +207,19 @@ class CacheManager:
         Returns:
             True if deleted, False if not found
         """
+        deleted = False
         with self._lock:
             if session_id in self._cache:
                 del self._cache[session_id]
-                return True
-            return False
+                deleted = True
+        
+        # Force GPU memory release after deleting cached tensors
+        if deleted:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return deleted
     
     def exists(self, session_id: str) -> bool:
         """Check if session exists and is not expired."""
@@ -216,7 +235,14 @@ class CacheManager:
         with self._lock:
             count = len(self._cache)
             self._cache.clear()
-            return count
+        
+        # Force GPU memory release after clearing all cached tensors
+        if count > 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return count
 
 
 # Global cache manager instance

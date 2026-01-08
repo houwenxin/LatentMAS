@@ -252,8 +252,10 @@ class ModelWrapper:
         aligned = torch.matmul(hidden_fp32, matrix)
 
         aligned_norm = aligned.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        pre_aligned = aligned.detach().clone()
-        self.pre_aligned = pre_aligned
+        # Note: self.pre_aligned is only set when needed for ablation studies
+        # to avoid memory accumulation during normal operation
+        # pre_aligned = aligned.detach().clone()
+        # self.pre_aligned = pre_aligned
         aligned = aligned * (target_norm / aligned_norm)
         return aligned.to(hidden.dtype)
 
