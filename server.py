@@ -381,6 +381,8 @@ async def chat_completions(request: ChatCompletionRequest):
             debug_continuation_prompt=request.debug_continuation_prompt,
             latent_space_realign=request.latent_space_realign,
             latent_only=request.latent_only,
+            temperature=request.temperature,
+            top_p=request.top_p,
         )
         
         # Store/update cache

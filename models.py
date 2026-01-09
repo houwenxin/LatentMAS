@@ -587,6 +587,8 @@ class ModelWrapper:
         debug_continuation_prompt: Optional[str] = None,
         latent_space_realign: bool = False,
         latent_only: bool = False,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
     ) -> Tuple[Tuple, str, int, List[int]]:
         """
         Generate latent representations for API usage.
@@ -642,30 +644,14 @@ class ModelWrapper:
         else:
             output_past_kv = new_past_kv
         if debug_max_tokens and debug_max_tokens > 0:
-            # Generate readable debug text using the accumulated KV cache
-            # Use the provided continuation prompt or default to empty/space
-            continuation_text = debug_continuation_prompt if debug_continuation_prompt is not None else ""
-            
-            debug_input_ids = self.tokenizer.encode(
-                continuation_text,
-                return_tensors="pt",
-                add_special_tokens=False,
-            ).to(self.device)
-            
-            # If empty string produces no tokens, use a single space
-            if debug_input_ids.shape[1] == 0:
-                debug_input_ids = torch.tensor([[self.tokenizer.encode(" ", add_special_tokens=False)[0]]], device=self.device)
-            
-            debug_attention_mask = torch.ones_like(debug_input_ids)
-            
             # Generate debug text (don't save the returned KV cache)
             debug_texts, _ = self.generate_text_batch(
-                debug_input_ids,
-                debug_attention_mask,
+                input_ids,
+                attention_mask,
                 max_new_tokens=debug_max_tokens,
-                temperature=0.7,
-                top_p=0.95,
-                past_key_values=new_past_kv,  # Use the latent-accumulated KV cache
+                temperature=temperature,
+                top_p=top_p,
+                past_key_values=past_key_values,  # Use the latent-accumulated KV cache
             )
             debug_text = debug_texts[0].strip() if debug_texts else ""
         else:
