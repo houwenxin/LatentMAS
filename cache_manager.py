@@ -57,11 +57,11 @@ class CacheManager:
     - last_accessed: Last access timestamp
     """
     
-    def __init__(self, ttl_seconds: int = 1800, cleanup_interval: int = 300):
+    def __init__(self, ttl_seconds: int = 1800, cleanup_interval: int = 1800):
         """
         Args:
             ttl_seconds: Time-to-live for cache entries (default 30 minutes)
-            cleanup_interval: Interval for cleanup thread (default 5 minutes)
+            cleanup_interval: Interval for cleanup thread (default 30 minutes)
         """
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -103,7 +103,7 @@ class CacheManager:
             for key in expired_keys:
                 del self._cache[key]
         
-        # Force GPU memory release after deleting cached tensors
+        # Batch cleanup: release memory only during periodic cleanup, not per-operation
         if expired_keys:
             gc.collect()
             if torch.cuda.is_available():
@@ -159,10 +159,6 @@ class CacheManager:
             # Check TTL
             if time.time() - entry["last_accessed"] > self._ttl:
                 del self._cache[session_id]
-                # Force GPU memory release
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 return None
             
             # Update access time
@@ -213,12 +209,6 @@ class CacheManager:
                 del self._cache[session_id]
                 deleted = True
         
-        # Force GPU memory release after deleting cached tensors
-        if deleted:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
         return deleted
     
     def exists(self, session_id: str) -> bool:
@@ -235,12 +225,6 @@ class CacheManager:
         with self._lock:
             count = len(self._cache)
             self._cache.clear()
-        
-        # Force GPU memory release after clearing all cached tensors
-        if count > 0:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         
         return count
 
