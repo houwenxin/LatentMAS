@@ -27,6 +27,9 @@ python server.py --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0,cuda:1,c
 | `--cache_ttl` | `1800` | Session cache TTL in seconds (30 min) |
 | `--host` | `0.0.0.0` | Host to bind to |
 | `--port` | `8000` | Port to bind to |
+| `--use_vllm` | `false` | Enable vLLM backend for accelerated text generation |
+| `--vllm_gpu_memory_utilization` | `0.9` | vLLM GPU memory utilization (0.0-1.0) |
+| `--vllm_tensor_parallel_size` | `1` | vLLM tensor parallel size for multi-GPU |
 
 ---
 
@@ -75,6 +78,7 @@ OpenAI-compatible chat completions with LatentMAS extensions.
 | `debug_max_tokens` | `int` | No | `50` | Max tokens for debug preview in latent mode |
 | `debug_continuation_prompt` | `string` | No | `null` | Continuation prompt for debug text generation |
 | `latent_only` | `bool` | No | `false` | Whether to keep input context in KV cache |
+| `use_vllm` | `bool` | No | `false` | Force use of vLLM for text generation (for `text` mode without session, or `normal` mode) |
 
 #### Response Body
 
@@ -156,7 +160,9 @@ session_id = response.json()["session_id"]
 
 ### Mode: `text`
 
-Generate text using cached KV values from previous latent calls.
+Generate text using cached KV values from previous latent calls, or use vLLM for fast generation without cache.
+
+**Option 1: With KV cache (session_id required)**
 
 ```python
 response = requests.post(
@@ -173,6 +179,51 @@ response = requests.post(
 print(response.json()["choices"][0]["message"]["content"])
 # Output uses context from latent reasoning
 ```
+
+**Option 2: vLLM accelerated (no session required)**
+
+When vLLM is enabled on the server (`--use_vllm`), you can use fast text generation without a session:
+
+```python
+response = requests.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "mode": "text",
+        "messages": [
+            {"role": "user", "content": "What is 2 + 2?"}
+        ],
+        "use_vllm": true,  # Force vLLM path
+        "max_tokens": 100
+    }
+)
+# Uses vLLM for high-throughput generation
+```
+
+---
+
+## vLLM Acceleration
+
+The server supports optional vLLM acceleration for high-throughput text generation.
+
+### Starting with vLLM
+
+```bash
+python server.py \
+    --model_name Qwen/Qwen2.5-7B-Instruct \
+    --devices cuda:0 \
+    --use_vllm \
+    --vllm_gpu_memory_utilization 0.9 \
+    --vllm_tensor_parallel_size 1
+```
+
+### When vLLM is used
+
+| Mode | vLLM Used? | Notes |
+|------|------------|-------|
+| `normal` | Yes (if enabled) | Automatic when `--use_vllm` is set |
+| `latent` | No | Uses HuggingFace for KV cache support |
+| `text` with session | No | Uses HuggingFace for KV cache injection |
+| `text` without session + `use_vllm: true` | Yes | Fast generation without latent context |
 
 ---
 

@@ -1,0 +1,38 @@
+# Build: docker build -f Dockerfile.vllm -t latentmas-vllm .
+# Run:   docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface latentmas-vllm
+#
+# With custom model:
+#   docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     latentmas-vllm --model_name Qwen/Qwen2.5-7B-Instruct --devices cuda:0
+
+# docker rm latentmas-dev
+
+# docker run -it --gpus all -p 8000:8000 \
+#   -v ~/.cache/huggingface:/root/.cache/huggingface \
+#   -v /home/core/LatentMAS:/app \
+#   --name latentmas-dev \
+#   --entrypoint /bin/bash \
+#   vllm/vllm-openai:latest
+
+FROM vllm/vllm-openai:latest
+
+WORKDIR /app
+
+# Install additional dependencies (vLLM image already has torch, transformers, etc.)
+COPY requirements.txt .
+RUN pip install --no-cache-dir fastapi uvicorn pydantic matplotlib
+RUN pip install matplotlib
+RUN pip install flash-attn --no-build-isolation
+
+# Copy application code
+COPY *.py ./
+COPY methods/ ./methods/
+COPY data/ ./data/
+
+# Expose the API port
+EXPOSE 8000
+
+# Default command - runs LatentMAS server with vLLM enabled
+# Override model_name and devices as needed
+ENTRYPOINT ["python", "server.py", "--use_vllm"]
+CMD ["--model_name", "Qwen/Qwen2.5-7B-Instruct", "--devices", "cuda:0"]

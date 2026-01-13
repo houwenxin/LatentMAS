@@ -15,7 +15,7 @@ BASE_URL = "http://10.224.120.13:8000"
 question = "A train travels from city A to city B at 60 km/h. The return trip is made at 40 km/h. What is the average speed for the entire journey?"
 system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
-debug_max_tokens = None  # Number of tokens to generate for debug preview in latent mode
+debug_max_tokens = 1024  # Number of tokens to generate for debug preview in latent mode
 debug_continuation_prompt = None
 latent_space_realign = False  # Whether to use latent space realignment in LatentMAS
 latent_only = False
@@ -1579,13 +1579,13 @@ if __name__ == "__main__":
     
     try:
         # Run tests
-        # test_health()
-        # test_normal_mode()
+        test_health()
+        test_normal_mode()
         test_latent_sequential()
-        # test_latent_dynamic()
-        # test_session_management()
+        test_latent_dynamic()
+        test_session_management()
         test_kv_injection_ablation()  # NEW: Verify KV injection is working
-        # test_complex_task()
+        test_complex_task()
         
         print("\n=== All tests completed ===")
     except requests.exceptions.ConnectionError:

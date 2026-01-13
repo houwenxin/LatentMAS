@@ -8,6 +8,7 @@ Provides a /v1/chat/completions endpoint with three modes:
 """
 
 import argparse
+import os
 import uuid
 import itertools
 from typing import List, Optional, Literal, Dict
@@ -21,6 +22,12 @@ from pydantic import BaseModel, Field
 from models import ModelWrapper
 from cache_manager import get_cache_manager, CacheManager
 
+try:
+    from vllm import LLM, SamplingParams
+    _HAS_VLLM = True
+except ImportError:
+    _HAS_VLLM = False
+
 
 # ==================== Helper Functions ====================
 
@@ -29,7 +36,7 @@ def detect_attention_implementation(model_wrapper: ModelWrapper) -> str:
     
     Returns one of: 'flash_attention_2', 'sdpa', 'eager', 'vllm', or 'unknown'
     """
-    if model_wrapper.use_vllm:
+    if model_wrapper.use_vllm and _HAS_VLLM:
         return 'vllm'
     
     # Check transformers model config
@@ -123,6 +130,12 @@ class ChatCompletionRequest(BaseModel):
         default=False,
         description="Skip debug text generation in latent mode, only generate and cache KV values"
     )
+    
+    # vLLM acceleration
+    use_vllm: bool = Field(
+        default=False,
+        description="Force use of vLLM for text generation (only for 'text' mode without session_id, or 'normal' mode when vLLM is enabled)"
+    )
 
 
 class Choice(BaseModel):
@@ -192,6 +205,10 @@ device_pool: Optional[itertools.cycle] = None  # Round-robin device selector
 cache_manager: Optional[CacheManager] = None
 default_latent_steps: int = 10
 
+# vLLM engine for high-throughput normal mode (optional)
+vllm_engine: Optional["LLM"] = None
+vllm_enabled: bool = False
+
 
 # ==================== Helper Functions ====================
 
@@ -206,14 +223,21 @@ def get_model_wrapper() -> ModelWrapper:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize model and cache manager on startup."""
-    global model_wrappers, device_pool, cache_manager, default_latent_steps
+    global model_wrappers, device_pool, cache_manager, default_latent_steps, vllm_engine, vllm_enabled
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="LatentMAS API Server")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct",
                         help="Model name or path")
-    parser.add_argument("--devices", type=str, default="cuda:0",
-                        help="Comma-separated list of devices (e.g., 'cuda:0,cuda:1,cuda:2')")
+    parser.add_argument("--devices", type=str, default=None,
+                        help="[DEPRECATED] Use --hf_devices instead. Comma-separated list of HF devices.")
+    parser.add_argument("--hf_devices", type=str, default=None,
+                        help="Comma-separated list of devices for HuggingFace model (e.g., 'cuda:0'). "
+                             "Required for latent/text modes. Defaults to 'cuda:0'.")
+    parser.add_argument("--vllm_devices", type=str, default=None,
+                        help="Comma-separated GPU indices for vLLM (e.g., '1,2,3'). "
+                             "These GPUs will be isolated from HF via CUDA_VISIBLE_DEVICES. "
+                             "If not specified, vLLM uses all GPUs not in --hf_devices.")
     parser.add_argument("--latent_steps", type=int, default=None,
                         help="Default latent reasoning steps")
     parser.add_argument("--cache_ttl", type=int, default=1800,
@@ -222,19 +246,85 @@ async def lifespan(app: FastAPI):
                         help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000,
                         help="Port to bind to")
+    # vLLM options for hybrid mode
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="Enable vLLM backend for 'normal' mode (high throughput). "
+                             "Requires separate GPUs from HF model.")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9,
+                        help="vLLM GPU memory utilization (0.0-1.0)")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=None,
+                        help="vLLM tensor parallel size. Defaults to number of vLLM GPUs.")
     
     args, _ = parser.parse_known_args()
     
     default_latent_steps = args.latent_steps
-    devices = [d.strip() for d in args.devices.split(',')]
+    
+    # ==================== GPU Allocation Logic ====================
+    # Determine available GPUs
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    print(f"[API] Detected {num_gpus} GPU(s)")
+    
+    # Handle deprecated --devices argument
+    if args.devices and not args.hf_devices:
+        print("[API] WARNING: --devices is deprecated, use --hf_devices instead")
+        args.hf_devices = args.devices
+    
+    # Parse HF devices (default to cuda:0)
+    if args.hf_devices:
+        hf_devices = [d.strip() for d in args.hf_devices.split(',')]
+    else:
+        hf_devices = ["cuda:0"] if num_gpus > 0 else ["cpu"]
+    
+    # Extract GPU indices used by HF
+    hf_gpu_indices = set()
+    for dev in hf_devices:
+        if dev.startswith("cuda:"):
+            try:
+                idx = int(dev.split(":")[1])
+                hf_gpu_indices.add(idx)
+            except (ValueError, IndexError):
+                pass
+    
+    # Determine vLLM GPU indices
+    if args.vllm_devices:
+        vllm_gpu_indices = [int(x.strip()) for x in args.vllm_devices.split(',')]
+    elif args.use_vllm and num_gpus > 1:
+        # Auto-assign: all GPUs except those used by HF
+        vllm_gpu_indices = [i for i in range(num_gpus) if i not in hf_gpu_indices]
+    else:
+        vllm_gpu_indices = []
+    
+    # Validate no overlap between HF and vLLM GPUs
+    overlap = hf_gpu_indices.intersection(set(vllm_gpu_indices))
+    if overlap and args.use_vllm:
+        print(f"[API] ERROR: GPU overlap detected between HF and vLLM: {overlap}")
+        print(f"[API] HF devices: {hf_devices} (GPU indices: {hf_gpu_indices})")
+        print(f"[API] vLLM GPU indices: {vllm_gpu_indices}")
+        raise ValueError(
+            f"GPU conflict: indices {overlap} are used by both HF and vLLM. "
+            f"Use --hf_devices and --vllm_devices to specify non-overlapping GPUs."
+        )
+    
+    # Check if vLLM can be enabled
+    if args.use_vllm and not vllm_gpu_indices:
+        if num_gpus <= 1:
+            print("[API] WARNING: --use_vllm requires multiple GPUs. Only 1 GPU available.")
+            print("[API] Disabling vLLM, using HuggingFace only.")
+            args.use_vllm = False
+        else:
+            print("[API] WARNING: No GPUs available for vLLM after HF allocation.")
+            args.use_vllm = False
     
     print(f"[API] Loading model: {args.model_name}")
-    print(f"[API] Devices: {devices}")
+    print(f"[API] HuggingFace devices: {hf_devices}")
+    if args.use_vllm:
+        print(f"[API] vLLM GPU indices: {vllm_gpu_indices}")
     print(f"[API] Default latent steps: {args.latent_steps}")
     
-    # Load model on each device
-    for device in devices:
-        print(f"[API] Loading model on {device}...")
+    # ==================== Load HuggingFace Model First ====================
+    # Load HF model BEFORE vLLM to ensure it claims its GPU memory first
+    for device in hf_devices:
+        print(f"[API] Loading HuggingFace model on {device}...")
         
         # Create a minimal args namespace for ModelWrapper
         model_args = argparse.Namespace(
@@ -257,17 +347,62 @@ async def lifespan(app: FastAPI):
         attn_impl = detect_attention_implementation(model_wrappers[device])
         print(f"[API] Attention implementation on {device}: {attn_impl}")
     
-    # Create round-robin device selector
-    device_pool = itertools.cycle(devices)
+    # Create round-robin device selector for HF models
+    device_pool = itertools.cycle(hf_devices)
+    
+    # ==================== Load vLLM Engine ====================
+    # Load vLLM AFTER HF model, using isolated GPUs
+    if args.use_vllm:
+        if not _HAS_VLLM:
+            print("[API] WARNING: --use_vllm specified but vLLM not installed. Falling back to HF.")
+        elif vllm_gpu_indices:
+            # Set CUDA_VISIBLE_DEVICES for vLLM subprocess/workers
+            # vLLM will see these as cuda:0, cuda:1, etc.
+            vllm_visible_devices = ",".join(str(i) for i in vllm_gpu_indices)
+            
+            # Determine tensor parallel size
+            tensor_parallel_size = args.vllm_tensor_parallel_size or len(vllm_gpu_indices)
+            
+            print(f"[API] Loading vLLM engine for 'normal' mode...")
+            print(f"[API] vLLM CUDA_VISIBLE_DEVICES (for workers): {vllm_visible_devices}")
+            print(f"[API] vLLM GPU memory utilization: {args.vllm_gpu_memory_utilization}")
+            print(f"[API] vLLM tensor parallel size: {tensor_parallel_size}")
+            
+            # Store original CUDA_VISIBLE_DEVICES
+            original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+            
+            try:
+                # Temporarily set CUDA_VISIBLE_DEVICES for vLLM initialization
+                os.environ["CUDA_VISIBLE_DEVICES"] = vllm_visible_devices
+                
+                vllm_engine = LLM(
+                    model=args.model_name,
+                    tensor_parallel_size=tensor_parallel_size,
+                    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    trust_remote_code=True,
+                )
+                vllm_enabled = True
+                print(f"[API] vLLM engine loaded successfully on GPUs: {vllm_gpu_indices}")
+            finally:
+                # Restore original CUDA_VISIBLE_DEVICES
+                if original_cuda_visible is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
+                elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                    del os.environ["CUDA_VISIBLE_DEVICES"]
     
     cache_manager = get_cache_manager(ttl_seconds=args.cache_ttl)
     
-    print(f"[API] Server ready with {len(devices)} device(s)!")
+    print(f"[API] Server ready with {len(hf_devices)} HF device(s)!")
+    if vllm_enabled:
+        print(f"[API] vLLM enabled for 'normal' mode (high throughput)")
+        print(f"[API] HuggingFace used for 'latent' and 'text' modes (KV cache support)")
     
     yield
     
     # Cleanup
     cache_manager.stop_cleanup_thread()
+    if vllm_engine is not None:
+        del vllm_engine
     print("[API] Server shutting down")
 
 
@@ -325,15 +460,29 @@ async def chat_completions(request: ChatCompletionRequest):
     
     if request.mode == "normal":
         # Standard generation - no latent, no cache
-        model_wrapper = get_model_wrapper()
-        generated_text = model_wrapper.generate_text_for_api(
-            prompt,
-            past_key_values=None,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            add_think_token=request.add_think_token,
-        )
+        # Use vLLM if enabled for high throughput, otherwise fall back to HF
+        if vllm_enabled and vllm_engine is not None:
+            # vLLM path: high throughput text generation
+            sampling_params = SamplingParams(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                max_tokens=request.max_tokens,
+            )
+            # Handle think token for vLLM
+            vllm_prompt = f"{prompt}<think>" if request.add_think_token else prompt
+            outputs = vllm_engine.generate([vllm_prompt], sampling_params)
+            generated_text = outputs[0].outputs[0].text.strip() if outputs else ""
+        else:
+            # HuggingFace fallback
+            model_wrapper = get_model_wrapper()
+            generated_text = model_wrapper.generate_text_for_api(
+                prompt,
+                past_key_values=None,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                add_think_token=request.add_think_token,
+            )
         
         completion_tokens = count_tokens(generated_text)
         
@@ -370,20 +519,41 @@ async def chat_completions(request: ChatCompletionRequest):
                     detail=f"Session '{request.session_id}' not found or expired"
                 )
         
-        # Generate new latent representations with debug text output
+        # Check if we should use vLLM for debug text generation
+        use_vllm_for_debug = (
+            vllm_enabled 
+            and vllm_engine is not None 
+            and request.debug_max_tokens 
+            and request.debug_max_tokens > 0
+        )
+        
+        # Generate new latent representations
+        # If using vLLM for debug, skip HF debug generation
         new_past_kv, debug_text, actual_steps, raw_token_ids = model_wrapper.generate_latent_for_api(
             prompt,
             latent_steps=latent_steps,
             past_key_values=past_kv,
             add_think_token=request.add_think_token,
             max_latent_steps=request.max_tokens,  # Use max_tokens as max latent steps
-            debug_max_tokens=request.debug_max_tokens,
+            debug_max_tokens=None if use_vllm_for_debug else request.debug_max_tokens,
             debug_continuation_prompt=request.debug_continuation_prompt,
             latent_space_realign=request.latent_space_realign,
             latent_only=request.latent_only,
             temperature=request.temperature,
             top_p=request.top_p,
         )
+        
+        # Generate debug text with vLLM if enabled (faster than HF)
+        if use_vllm_for_debug:
+            sampling_params = SamplingParams(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                max_tokens=request.debug_max_tokens,
+            )
+            # Use same prompt with optional think token
+            vllm_prompt = f"{prompt}<think>" if request.add_think_token else prompt
+            outputs = vllm_engine.generate([vllm_prompt], sampling_params)
+            debug_text = outputs[0].outputs[0].text.strip() if outputs else ""
         
         # Store/update cache
         if request.session_id:
@@ -424,11 +594,51 @@ async def chat_completions(request: ChatCompletionRequest):
         )
     
     elif request.mode == "text":
-        # Generate text using cached KV values
+        # Generate text using cached KV values, or vLLM for fresh generation
+        
+        # Check if we should use vLLM path (no KV cache)
+        use_vllm_path = (
+            request.use_vllm 
+            and vllm_enabled 
+            and vllm_engine is not None 
+            and not request.session_id
+        )
+        
+        if use_vllm_path:
+            # vLLM fast path: no KV cache, pure text generation
+            sampling_params = SamplingParams(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                max_tokens=request.max_tokens,
+            )
+            vllm_prompt = f"{prompt}<think>" if request.add_think_token else prompt
+            outputs = vllm_engine.generate([vllm_prompt], sampling_params)
+            generated_text = outputs[0].outputs[0].text.strip() if outputs else ""
+            
+            completion_tokens = count_tokens(generated_text)
+            
+            return ChatCompletionResponse(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    Choice(
+                        index=0,
+                        message=Message(role="assistant", content=generated_text),
+                    )
+                ],
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+                session_id=None,
+            )
+        
+        # Standard HuggingFace path with KV cache
         if not request.session_id:
             raise HTTPException(
                 status_code=400,
-                detail="session_id is required for 'text' mode"
+                detail="session_id is required for 'text' mode (or use use_vllm=true for fresh generation without cache)"
             )
         
         model_wrapper = get_model_wrapper()
@@ -529,11 +739,35 @@ async def cleanup_memory():
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    # Get vLLM GPU info if available
+    vllm_info = None
+    if vllm_enabled and vllm_engine is not None:
+        try:
+            # vLLM doesn't expose GPU indices directly, but we can infer from config
+            vllm_info = {
+                "tensor_parallel_size": getattr(vllm_engine, 'llm_engine', {}) and 
+                                        getattr(vllm_engine.llm_engine, 'parallel_config', None) and
+                                        getattr(vllm_engine.llm_engine.parallel_config, 'tensor_parallel_size', 'unknown') or 'unknown',
+            }
+        except Exception:
+            vllm_info = {"status": "running"}
+    
     return {
         "status": "healthy",
         "model_loaded": len(model_wrappers) > 0,
-        "devices": list(model_wrappers.keys()),
+        "hf_devices": list(model_wrappers.keys()),
         "active_sessions": cache_manager.size() if cache_manager else 0,
+        "vllm_enabled": vllm_enabled,
+        "vllm_info": vllm_info,
+        "backends": {
+            "normal_mode": "vllm" if vllm_enabled else "huggingface",
+            "latent_mode": "huggingface (latent) + vllm (debug)" if vllm_enabled else "huggingface",
+            "text_mode": "vllm (use_vllm=true, no session) or huggingface (with session)" if vllm_enabled else "huggingface",
+        },
+        "gpu_separation": {
+            "hf_gpus": list(model_wrappers.keys()),
+            "vllm_isolated": vllm_enabled,
+        },
     }
 
 
