@@ -254,6 +254,9 @@ async def lifespan(app: FastAPI):
                         help="vLLM GPU memory utilization (0.0-1.0)")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=None,
                         help="vLLM tensor parallel size. Defaults to number of vLLM GPUs.")
+    parser.add_argument("--vllm_max_model_len", type=int, default=None,
+                        help="Maximum sequence length for vLLM. If not set, uses model's default. "
+                             "Reduce this if you encounter KV cache memory errors.")
     
     args, _ = parser.parse_known_args()
     
@@ -379,6 +382,7 @@ async def lifespan(app: FastAPI):
                     model=args.model_name,
                     tensor_parallel_size=tensor_parallel_size,
                     gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    max_model_len=args.vllm_max_model_len,
                     trust_remote_code=True,
                 )
                 vllm_enabled = True
