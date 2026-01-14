@@ -5,8 +5,9 @@
 # Run with custom model/devices:
 # docker run --gpus all -p 8000:8000 \
 #   -v ~/.cache/huggingface:/root/.cache/huggingface \
+#   --entrypoint python3 \
 #   latentmas-vllm \
-#   python3 server.py --use_vllm --model_name Qwen/Qwen2.5-7B-Instruct --vllm_devices 0 --hf_devices cuda:0
+#   server.py --use_vllm --model_name Qwen/Qwen2.5-7B-Instruct --vllm_devices 1 --hf_devices cuda:0
 
 # Interactive development mode:
 # docker run -it --gpus all -p 8000:8000 \
@@ -29,7 +30,6 @@ RUN pip install flash-attn --no-build-isolation
 COPY *.py ./
 COPY methods/ ./methods/
 COPY data/ ./data/
-COPY tools/ ./tools/
 
 # Expose the API port
 EXPOSE 8000
