@@ -34,6 +34,6 @@ COPY data/ ./data/
 # Expose the API port
 EXPOSE 8000
 
-# Default command - runs LatentMAS server with vLLM enabled
-# Override model_name and devices as needed
+# Clear base image entrypoint and set default command
+ENTRYPOINT []
 CMD ["python3", "server.py", "--use_vllm", "--model_name", "Qwen/Qwen3-8B", "--vllm_devices", "1", "--hf_devices", "cuda:0"]
