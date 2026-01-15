@@ -17,7 +17,7 @@ system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assi
 
 debug_max_tokens = 1024  # Number of tokens to generate for debug preview in latent mode
 debug_continuation_prompt = None
-latent_space_realign = False  # Whether to use latent space realignment in LatentMAS
+latent_space_realign = True  # Whether to use latent space realignment in LatentMAS
 latent_only = False
 add_think_token = True
 
@@ -70,7 +70,7 @@ Now output your plan to solve the question below:"""
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": planner_prompt}
             ],
-            "latent_steps": 5,
+            "latent_steps": 100,
             "latent_space_realign": latent_space_realign,
             "debug_max_tokens": debug_max_tokens,
             "debug_continuation_prompt": debug_continuation_prompt,
@@ -83,9 +83,14 @@ Now output your plan to solve the question below:"""
     print(f"Content: {result1['choices'][0]['message']['content']}")
     print(f"Usage: {result1['usage']}")
     
+    # Print cache size after Planner
+    print("\n=== After Planner Agent ===")
+    cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
+    print(f"Cache Embeddings Shape: {cache_embedding.json()}")
+    
     # Step 2: Critic agent
     print("\n[Step 2] Critic Agent - Latent (5 steps)")
-    critic_prompt = f"""Question: {question}
+    critic_prompt = f"""Question: Check context
 
 You are a Critic Agent to evaluate the correctness of the input plan for the given question and provide helpful feedback for improving the plan.
 The plan information is provided in latent KV representation format. Review the plan and question and output:
@@ -107,7 +112,7 @@ Now, output your response below:"""
                 {"role": "user", "content": critic_prompt}
             ],
             "session_id": session_id,
-            "latent_steps": 5,
+            "latent_steps": 100,
             "latent_space_realign": latent_space_realign,
             "debug_max_tokens": debug_max_tokens,
             "debug_continuation_prompt": debug_continuation_prompt,
@@ -120,9 +125,13 @@ Now, output your response below:"""
     print(f"Content: {result2['choices'][0]['message']['content']}")
     print(f"Usage: {result2['usage']}")
     
+    print("\n=== After Critic Agent ===")
+    cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
+    print(f"Cache Embeddings Shape: {cache_embedding.json()}")
+    
     # Step 3: Refiner agent
     print("\n[Step 3] Refiner Agent - Latent (5 steps)")
-    refiner_prompt = f"""Question: {question}
+    refiner_prompt = f"""Question: Check context
 
 You are a Refiner Agent to provide a refined step-by-step plan for solving the given question.
 You are provided with:
@@ -142,7 +151,7 @@ Now, output your refined plan below:"""
                 {"role": "user", "content": refiner_prompt}
             ],
             "session_id": session_id,
-            "latent_steps": 5,
+            "latent_steps": 100,
             "latent_space_realign": latent_space_realign,
             "debug_max_tokens": debug_max_tokens,
             "debug_continuation_prompt": debug_continuation_prompt,
@@ -154,9 +163,14 @@ Now, output your refined plan below:"""
     print(f"Session ID: {result3['session_id']}")
     print(f"Message: {result3['choices'][0]['message']['content']}")
     
+    print("\n=== After Refiner Agent ===")
+    cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
+    print(f"Cache Embeddings Shape: {cache_embedding.json()}")
+        
+    
     # Step 4: Judger agent - text generation
     print("\n[Step 4] Judger Agent - Text Generation")
-    judger_prompt = f"""Target Question: {question}
+    judger_prompt = f"""Target Question: Check context
 
 You are a helpful assistant. You are provided with latent information for reference and a target question to solve. 
 
@@ -172,7 +186,7 @@ Answer: \\boxed{{YOUR_FINAL_ANSWER}}
 
 Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.
 """
-    
+    # judger_prompt = "What is in the context?"
     resp4 = requests.post(
         f"{BASE_URL}/v1/chat/completions",
         json={
@@ -375,9 +389,9 @@ Remember this character information in the first 20 output tokens for future ref
     print(f"✓ Outputs are different: {outputs_differ}")
     
     # Check if "with KV" response mentions key information
-    has_voss = "voss" in output_with_kv.lower()
+    has_age = "42" in output_with_kv.lower()
     has_algorithm_engineer = "algorithm engineer" in output_with_kv.lower()
-    has_context_info = has_voss and has_algorithm_engineer
+    has_context_info = has_age and has_algorithm_engineer
     print(f"✓ Response WITH KV contains context info: {has_context_info}")
     
     # Check if "without KV" response lacks the information
@@ -1562,7 +1576,7 @@ def test_complex_task():
             "mode": "text",
             "messages": [
                 {"role": "system", "content": system_message},
-                {"role": "user", "content": "Please summarize what is in the KV cache:"}
+                {"role": "user", "content": "Please summarize what is in the context:"}
             ],
             "session_id": session_id,
             "max_tokens": 1024,
@@ -1579,13 +1593,13 @@ if __name__ == "__main__":
     
     try:
         # Run tests
-        test_health()
-        test_normal_mode()
+        # test_health()
+        # test_normal_mode()
         test_latent_sequential()
-        test_latent_dynamic()
-        test_session_management()
-        test_kv_injection_ablation()  # NEW: Verify KV injection is working
-        test_complex_task()
+        # test_latent_dynamic()
+        # test_session_management()
+        # test_kv_injection_ablation()  # NEW: Verify KV injection is working
+        # test_complex_task()
         
         print("\n=== All tests completed ===")
     except requests.exceptions.ConnectionError:

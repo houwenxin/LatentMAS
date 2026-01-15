@@ -1,14 +1,16 @@
 """
-KV Cache Manager for LatentMAS API
+Embedding Cache Manager for LatentMAS API
 
-Manages server-side storage of KV caches with TTL expiration.
+Manages server-side storage of latent embeddings with TTL expiration.
+Used for hybrid vLLM + HuggingFace mode where HF generates latent embeddings
+and vLLM uses them for text generation.
 """
 
 import gc
 import time
 import uuid
 import threading
-from typing import Dict, Optional, Tuple, Any, Union
+from typing import Dict, Optional, Tuple, Any, Union, List
 import torch
 try:
     from transformers.cache_utils import Cache, DynamicCache
@@ -16,43 +18,22 @@ except ImportError:
     Cache = None
     DynamicCache = None
 
-def _move_kv_to_device(past_key_values: Tuple, device: Union[str, torch.device]) -> Tuple:
-    """
-    Move KV cache tensors to specified device.
-    Handles both Cache objects (DynamicCache) and legacy tuple format.
-    
-    Args:
-        past_key_values: Cache object or nested tuple structure
-        device: Target device (e.g., 'cpu', 'cuda:0')
-        
-    Returns:
-        KV cache with all tensors moved to target device (always as legacy tuple format for storage)
-    """
-    if past_key_values is None:
+
+def _move_tensor_to_device(tensor: torch.Tensor, device: Union[str, torch.device]) -> torch.Tensor:
+    """Move a tensor to specified device."""
+    if tensor is None:
         return None
-    
-    # Handle Cache objects (DynamicCache, etc.)
-    if Cache is not None and isinstance(past_key_values, Cache):
-        # Convert to legacy format, move tensors, keep as legacy for CPU storage
-        legacy = past_key_values.to_legacy_cache()
-        return tuple(
-            tuple(tensor.to(device) for tensor in layer)
-            for layer in legacy
-        )
-    
-    # Handle legacy tuple format
-    return tuple(
-        tuple(tensor.to(device) for tensor in layer)
-        for layer in past_key_values
-    )
+    return tensor.to(device)
 
 
-class CacheManager:
+class EmbeddingCacheManager:
     """
-    Thread-safe in-memory cache manager for KV caches.
+    Thread-safe in-memory cache manager for latent embeddings.
     
     Each session stores:
-    - past_key_values: The accumulated KV cache
+    - embeddings: The latent embedding tensor [1, L, H]
+    - shape: Shape of the embeddings for debugging
+    - latent_steps: Number of latent steps taken
     - created_at: Timestamp for TTL management
     - last_accessed: Last access timestamp
     """
@@ -111,12 +92,18 @@ class CacheManager:
         
         return len(expired_keys)
     
-    def create(self, past_key_values: Tuple, session_id: Optional[str] = None) -> str:
+    def create(
+        self, 
+        embeddings: torch.Tensor, 
+        latent_steps: int,
+        session_id: Optional[str] = None
+    ) -> str:
         """
-        Create a new cache entry.
+        Create a new cache entry for latent embeddings.
         
         Args:
-            past_key_values: The KV cache to store (will be moved to CPU)
+            embeddings: The latent embeddings tensor [1, L, H] (will be moved to CPU)
+            latent_steps: Number of latent steps taken
             session_id: Optional custom session ID. If None, UUID is generated.
             
         Returns:
@@ -125,31 +112,38 @@ class CacheManager:
         if session_id is None:
             session_id = str(uuid.uuid4())
         
-        # Move KV cache to CPU to save GPU memory
-        past_kv_cpu = _move_kv_to_device(past_key_values, 'cpu')
+        # Move embeddings to CPU to save GPU memory
+        embeddings_cpu = _move_tensor_to_device(embeddings, 'cpu')
+        shape = list(embeddings_cpu.shape) if embeddings_cpu is not None else None
         
         now = time.time()
         with self._lock:
             self._cache[session_id] = {
-                "past_key_values": past_kv_cpu,
+                "embeddings": embeddings_cpu,
+                "shape": shape,
+                "latent_steps": latent_steps,
                 "created_at": now,
                 "last_accessed": now,
             }
         
         return session_id
     
-    def get(self, session_id: str, device: Union[str, torch.device] = 'cuda:0') -> Optional[Tuple]:
+    def get(
+        self, 
+        session_id: str, 
+        device: Union[str, torch.device] = 'cuda:0'
+    ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve KV cache by session ID and migrate to target device.
+        Retrieve embeddings by session ID and migrate to target device.
         
         Updates last_accessed timestamp on access.
         
         Args:
             session_id: Session identifier
-            device: Target device to move KV cache to (default: 'cuda:0')
+            device: Target device to move embeddings to (default: 'cuda:0')
         
         Returns:
-            The past_key_values tuple moved to target device, or None if not found/expired
+            Dict with 'embeddings', 'shape', 'latent_steps' or None if not found/expired
         """
         with self._lock:
             entry = self._cache.get(session_id)
@@ -163,36 +157,46 @@ class CacheManager:
             
             # Update access time
             entry["last_accessed"] = time.time()
-            past_kv_cpu = entry["past_key_values"]
+            embeddings_cpu = entry["embeddings"]
+            shape = entry["shape"]
+            latent_steps = entry["latent_steps"]
         
         # Migrate from CPU to GPU (outside lock to avoid blocking other operations)
-        past_kv_gpu = _move_kv_to_device(past_kv_cpu, device)
+        embeddings_gpu = _move_tensor_to_device(embeddings_cpu, device)
         
-        # Convert back to DynamicCache for modern transformers models (e.g., Qwen3)
-        # that expect Cache objects with get_seq_length() method
-        if DynamicCache is not None and isinstance(past_kv_gpu, tuple):
-            past_kv_gpu = DynamicCache.from_legacy_cache(past_kv_gpu)
-        
-        return past_kv_gpu
+        return {
+            "embeddings": embeddings_gpu,
+            "shape": shape,
+            "latent_steps": latent_steps,
+        }
     
-    def update(self, session_id: str, past_key_values: Tuple) -> bool:
+    def update(
+        self, 
+        session_id: str, 
+        embeddings: torch.Tensor,
+        latent_steps: int
+    ) -> bool:
         """
         Update existing cache entry.
         
         Args:
-            past_key_values: The KV cache to store (will be moved to CPU)
+            embeddings: The embeddings tensor to store (will be moved to CPU)
+            latent_steps: Number of latent steps
         
         Returns:
             True if updated, False if session not found
         """
-        # Move KV cache to CPU to save GPU memory
-        past_kv_cpu = _move_kv_to_device(past_key_values, 'cpu')
+        # Move embeddings to CPU to save GPU memory
+        embeddings_cpu = _move_tensor_to_device(embeddings, 'cpu')
+        shape = list(embeddings_cpu.shape) if embeddings_cpu is not None else None
         
         with self._lock:
             if session_id not in self._cache:
                 return False
             
-            self._cache[session_id]["past_key_values"] = past_kv_cpu
+            self._cache[session_id]["embeddings"] = embeddings_cpu
+            self._cache[session_id]["shape"] = shape
+            self._cache[session_id]["latent_steps"] = latent_steps
             self._cache[session_id]["last_accessed"] = time.time()
             return True
     
@@ -213,7 +217,14 @@ class CacheManager:
     
     def exists(self, session_id: str) -> bool:
         """Check if session exists and is not expired."""
-        return self.get(session_id) is not None
+        with self._lock:
+            entry = self._cache.get(session_id)
+            if entry is None:
+                return False
+            if time.time() - entry["last_accessed"] > self._ttl:
+                del self._cache[session_id]
+                return False
+            return True
     
     def size(self) -> int:
         """Return number of cached sessions."""
@@ -229,14 +240,18 @@ class CacheManager:
         return count
 
 
+# Backwards compatibility alias
+CacheManager = EmbeddingCacheManager
+
+
 # Global cache manager instance
-_cache_manager: Optional[CacheManager] = None
+_cache_manager: Optional[EmbeddingCacheManager] = None
 
 
-def get_cache_manager(ttl_seconds: int = 1800) -> CacheManager:
+def get_cache_manager(ttl_seconds: int = 1800) -> EmbeddingCacheManager:
     """Get or create the global cache manager instance."""
     global _cache_manager
     if _cache_manager is None:
-        _cache_manager = CacheManager(ttl_seconds=ttl_seconds)
+        _cache_manager = EmbeddingCacheManager(ttl_seconds=ttl_seconds)
         _cache_manager.start_cleanup_thread()
     return _cache_manager

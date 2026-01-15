@@ -683,3 +683,235 @@ class ModelWrapper:
         
         return generated_batch[0].strip()
 
+    # ==================== Hybrid vLLM + HF API methods ====================
+    
+    @torch.no_grad()
+    def generate_latent_with_embeddings_for_api(
+        self,
+        prompt: str,
+        *,
+        latent_steps: int = 10,
+        add_think_token: bool = False,
+        latent_space_realign: bool = False,
+        past_embeddings: Optional[torch.Tensor] = None,
+        embedding_insert_marker: str = "<|im_start|>user\n",
+        latent_only: bool = False,
+    ) -> Tuple[torch.Tensor, int, List[int]]:
+        """
+        Generate latent representations and return embeddings for hybrid vLLM mode.
+        
+        This method uses HuggingFace to generate latent hidden states, which can
+        later be injected into vLLM for text generation. Like text mode, it combines
+        past embeddings with current input embeddings before running through the model.
+        
+        Args:
+            prompt: The text prompt (already formatted with chat template)
+            latent_steps: Number of latent reasoning steps
+            add_think_token: Whether to append <think> token
+            latent_space_realign: Whether to apply latent space realignment
+            past_embeddings: Optional tensor of shape [1, L, H] from previous latent calls
+                            in the same session. These will be inserted into the prompt
+                            embeddings to CONDITION the new generation.
+            embedding_insert_marker: String marker after which to insert past embeddings
+            latent_only: If True, only return the latent step embeddings (exclude prompt embeddings)
+            
+        Returns:
+            Tuple of:
+            - latent_embeddings: Tensor of shape [1, L, H] containing embeddings.
+                                If latent_only=False: combined input + new latent steps
+                                If latent_only=True: only new latent step embeddings
+            - actual_steps: Number of NEW latent steps taken in this call
+            - generated_token_ids: Raw token IDs decoded from latent steps (for debugging)
+        """
+        if add_think_token:
+            prompt = f"{prompt}<think>"
+        
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        
+        # Get embedding layer and compute input embeddings
+        embedding_layer = self.model.get_input_embeddings()
+        input_embeddings = embedding_layer(input_ids)  # [1, L, H]
+        
+        # If we have past embeddings, insert them into input embeddings (like text mode)
+        if past_embeddings is not None:
+            past_embeddings = past_embeddings.to(self.device)
+            
+            # Find insertion point for past embeddings
+            insert_idx = 0
+            marker_pos = prompt.find(embedding_insert_marker)
+            if marker_pos >= 0:
+                left_text = prompt[:marker_pos + len(embedding_insert_marker)]
+                left_tokens = self.tokenizer(left_text, add_special_tokens=False)["input_ids"]
+                insert_idx = len(left_tokens)
+            
+            # Split and insert: [left_prompt] + [past_embeddings] + [right_prompt]
+            left_emb = input_embeddings[:, :insert_idx, :]
+            right_emb = input_embeddings[:, insert_idx:, :]
+            combined_input = torch.cat([left_emb, past_embeddings, right_emb], dim=1)
+        else:
+            combined_input = input_embeddings
+        
+        # Create attention mask for combined input
+        attention_mask = torch.ones(
+            (1, combined_input.shape[1]),
+            dtype=torch.long,
+            device=self.device,
+        )
+        
+        # Initial forward pass with combined embeddings
+        outputs = self.model(
+            inputs_embeds=combined_input,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past = outputs.past_key_values
+        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
+        
+        # Start recording embeddings
+        # If latent_only, we only record latent step embeddings (not input)
+        embedding_record: List[torch.Tensor] = []
+        if not latent_only:
+            embedding_record.append(combined_input.detach())
+        
+        # Get lm_head for token decoding (debugging)
+        lm_head = self.model.lm_head if hasattr(self.model, 'lm_head') else self.model.get_output_embeddings()
+        generated_tokens: List[int] = []
+        
+        for step in range(latent_steps):
+            # Decode token from current hidden state (for debugging)
+            logits = lm_head(last_hidden)
+            token_id = logits.argmax(dim=-1)[0].item()
+            generated_tokens.append(token_id)
+            
+            # Apply latent realignment
+            latent_vec = self._apply_latent_realignment(last_hidden, self.model, latent_space_realign)
+            latent_embed = latent_vec.unsqueeze(1)  # [B, 1, H]
+            
+            # Record the latent embedding
+            embedding_record.append(latent_embed.detach())
+            
+            # Forward pass with latent embedding
+            past_len = _past_length(past)
+            latent_mask = torch.ones(
+                (latent_embed.shape[0], past_len + 1),
+                dtype=torch.long,
+                device=self.device,
+            )
+            outputs = self.model(
+                inputs_embeds=latent_embed,
+                attention_mask=latent_mask,
+                past_key_values=past,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = outputs.past_key_values
+            last_hidden = outputs.hidden_states[-1][:, -1, :]
+        
+        # Concatenate all embeddings: [combined_input + latent_steps]
+        latent_embeddings = torch.cat(embedding_record, dim=1)
+        
+        return latent_embeddings, latent_steps, generated_tokens
+
+    @torch.no_grad()
+    def generate_text_with_embeddings_for_api(
+        self,
+        prompt: str,
+        latent_embeddings: torch.Tensor,
+        vllm_engine: "LLM",
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        add_think_token: bool = False,
+        embedding_insert_marker: str = "<|im_start|>user\n",
+    ) -> str:
+        """
+        Generate text using vLLM with injected latent embeddings.
+        
+        This method embeds the text prompt, inserts the latent embeddings at the
+        appropriate position (after the user message start marker), and generates
+        text using vLLM with the combined embeddings.
+        
+        Args:
+            prompt: The text prompt (already formatted with chat template)
+            latent_embeddings: Tensor of shape [1, L, H] from generate_latent_with_embeddings_for_api
+            vllm_engine: The vLLM LLM engine instance
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            add_think_token: Whether to append <think> token
+            embedding_insert_marker: String marker after which to insert latent embeddings
+            
+        Returns:
+            Generated text string
+        """
+        if add_think_token:
+            prompt = f"{prompt}<think>"
+        
+        # Tokenize the prompt
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        
+        # Get the embedding layer
+        embedding_layer = self.model.get_input_embeddings()
+        
+        # Get prompt embeddings
+        prompt_embeddings = embedding_layer(input_ids)  # [1, L, H]
+        
+        
+        if latent_embeddings is not None:
+            # Find insertion point for latent embeddings
+            # Look for the marker in the prompt text
+            insert_idx = 0
+            marker_pos = prompt.find(embedding_insert_marker)
+            if marker_pos >= 0:
+                # Tokenize just the text up to and including the marker
+                left_text = prompt[:marker_pos + len(embedding_insert_marker)]
+                left_tokens = self.tokenizer(left_text, add_special_tokens=False)["input_ids"]
+                insert_idx = len(left_tokens)
+            # Move latent embeddings to same device as prompt embeddings
+            latent_embeddings = latent_embeddings.to(prompt_embeddings.device)
+            
+            # Split prompt embeddings at insertion point and insert latent embeddings
+            left_emb = prompt_embeddings[:, :insert_idx, :]
+            right_emb = prompt_embeddings[:, insert_idx:, :]
+            
+            # Concatenate: [left_prompt] + [latent_embeddings] + [right_prompt]
+            # Note: latent_embeddings already contains input embeddings from latent mode,
+            # so we only take the latent steps portion (skip the input embeddings part)
+            # Actually, for flexibility, we take all of latent_embeddings since the caller
+            # can decide what to include
+            combined_embeddings = torch.cat([left_emb, latent_embeddings, right_emb], dim=1)
+        else:
+            combined_embeddings = prompt_embeddings
+        # Prepare for vLLM
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+        )
+        
+        # vLLM expects prompt_embeds in a specific format
+        prompt_embeds_list = [
+            {"prompt_embeds": combined_embeddings[0]}  # Remove batch dimension
+        ]
+        
+        outputs = vllm_engine.generate(prompt_embeds_list, sampling_params)
+        generated_text = outputs[0].outputs[0].text.strip() if outputs else ""
+        
+        return generated_text
+

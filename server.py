@@ -3,8 +3,13 @@ LatentMAS OpenAI-Compatible API Server
 
 Provides a /v1/chat/completions endpoint with three modes:
 - normal: Standard text generation (no latent reasoning)
-- latent: Generate latent representations, store KV cache in session
-- text: Generate text using cached KV values from previous latent calls
+- latent: Generate latent embeddings using HuggingFace, store in session
+- text: Generate text using vLLM with cached latent embeddings
+
+Hybrid Mode (vLLM + HuggingFace):
+- HuggingFace generates latent embeddings during 'latent' mode
+- vLLM uses those embeddings for fast text generation in 'text' mode
+- Requires --use_vllm flag to enable hybrid mode
 """
 
 import argparse
@@ -20,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from models import ModelWrapper
-from cache_manager import get_cache_manager, CacheManager
+from cache_manager import get_cache_manager, EmbeddingCacheManager
 
 try:
     from vllm import LLM, SamplingParams
@@ -155,7 +160,7 @@ class Usage(BaseModel):
     )
     kv_cache_shape: Optional[List[int]] = Field(
         default=None,
-        description="Shape of KV cache tensors [batch, heads, seq_len, head_dim] (only for 'latent' mode)"
+        description="Shape of latent embeddings [batch, seq_len, hidden_dim] (only for 'latent' mode)"
     )
 
 
@@ -171,38 +176,15 @@ class ChatCompletionResponse(BaseModel):
     # LatentMAS specific
     session_id: Optional[str] = Field(
         default=None,
-        description="Session ID for cached KV values (returned in latent/text modes)"
+        description="Session ID for cached embeddings (returned in latent/text modes)"
     )
-
-
-# ==================== Helper Functions ====================
-
-def get_kv_cache_shape(past_key_values) -> Optional[List[int]]:
-    """Extract shape [batch, heads, seq_len, head_dim] from first layer's key tensor."""
-    if past_key_values is None:
-        return None
-    
-    # Handle DynamicCache objects from transformers
-    try:
-        from transformers.cache_utils import Cache
-        if isinstance(past_key_values, Cache):
-            past_key_values = past_key_values.to_legacy_cache()
-    except ImportError:
-        pass
-    
-    if past_key_values and len(past_key_values) > 0:
-        first_layer = past_key_values[0]
-        if first_layer and len(first_layer) > 0:
-            key_tensor = first_layer[0]  # First layer's key tensor
-            return list(key_tensor.shape)
-    return None
 
 
 # ==================== Global State ====================
 
 model_wrappers: Dict[str, ModelWrapper] = {}  # device -> ModelWrapper
 device_pool: Optional[itertools.cycle] = None  # Round-robin device selector
-cache_manager: Optional[CacheManager] = None
+cache_manager: Optional[EmbeddingCacheManager] = None
 default_latent_steps: int = 10
 
 # vLLM engine for high-throughput normal mode (optional)
@@ -366,7 +348,7 @@ async def lifespan(app: FastAPI):
             # Determine tensor parallel size
             tensor_parallel_size = args.vllm_tensor_parallel_size or len(vllm_gpu_indices)
             
-            print(f"[API] Loading vLLM engine for 'normal' mode...")
+            print(f"[API] Loading vLLM engine for hybrid mode...")
             print(f"[API] vLLM CUDA_VISIBLE_DEVICES (for workers): {vllm_visible_devices}")
             print(f"[API] vLLM GPU memory utilization: {args.vllm_gpu_memory_utilization}")
             print(f"[API] vLLM tensor parallel size: {tensor_parallel_size}")
@@ -384,9 +366,11 @@ async def lifespan(app: FastAPI):
                     gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                     max_model_len=args.vllm_max_model_len,
                     trust_remote_code=True,
+                    enable_prompt_embeds=True,  # Required for hybrid mode with latent embeddings
                 )
                 vllm_enabled = True
                 print(f"[API] vLLM engine loaded successfully on GPUs: {vllm_gpu_indices}")
+                print(f"[API] vLLM prompt_embeds enabled for hybrid latent mode")
             finally:
                 # Restore original CUDA_VISIBLE_DEVICES
                 if original_cuda_visible is not None:
@@ -398,8 +382,9 @@ async def lifespan(app: FastAPI):
     
     print(f"[API] Server ready with {len(hf_devices)} HF device(s)!")
     if vllm_enabled:
-        print(f"[API] vLLM enabled for 'normal' mode (high throughput)")
-        print(f"[API] HuggingFace used for 'latent' and 'text' modes (KV cache support)")
+        print(f"[API] Hybrid mode enabled:")
+        print(f"[API]   - HuggingFace generates latent embeddings (latent mode)")
+        print(f"[API]   - vLLM uses embeddings for text generation (text mode)")
     
     yield
     
@@ -508,72 +493,58 @@ async def chat_completions(request: ChatCompletionRequest):
         )
     
     elif request.mode == "latent":
-        # Generate latent representations and cache KV values
-        # If latent_steps is None, generate until EOS token
-        latent_steps = request.latent_steps  # Can be None for dynamic stopping
+        # Generate latent representations and cache embeddings for hybrid vLLM mode
+        latent_steps = request.latent_steps or default_latent_steps or 10
         
-        # Load existing cache if session_id provided
-        past_kv = None
+        # Hybrid mode requires vLLM to be enabled
+        if not vllm_enabled or vllm_engine is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Latent mode requires vLLM to be enabled. Start server with --use_vllm flag."
+            )
+        
         model_wrapper = get_model_wrapper()
+        
+        # Load existing embeddings if session_id provided (for accumulating across calls)
+        past_embeddings = None
         if request.session_id:
-            past_kv = cache_manager.get(request.session_id, device=str(model_wrapper.device))
-            if past_kv is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Session '{request.session_id}' not found or expired"
-                )
+            cached_data = cache_manager.get(request.session_id, device=str(model_wrapper.device))
+            if cached_data is not None:
+                past_embeddings = cached_data["embeddings"]
         
-        # Check if we should use vLLM for debug text generation
-        use_vllm_for_debug = (
-            vllm_enabled 
-            and vllm_engine is not None 
-            and request.debug_max_tokens 
-            and request.debug_max_tokens > 0
-        )
-        
-        # Generate new latent representations
-        # If using vLLM for debug, skip HF debug generation
-        new_past_kv, debug_text, actual_steps, raw_token_ids = model_wrapper.generate_latent_for_api(
+        # Generate latent embeddings using HuggingFace
+        latent_embeddings, actual_steps, raw_token_ids = model_wrapper.generate_latent_with_embeddings_for_api(
             prompt,
             latent_steps=latent_steps,
-            past_key_values=past_kv,
             add_think_token=request.add_think_token,
-            max_latent_steps=request.max_tokens,  # Use max_tokens as max latent steps
-            debug_max_tokens=None if use_vllm_for_debug else request.debug_max_tokens,
-            debug_continuation_prompt=request.debug_continuation_prompt,
             latent_space_realign=request.latent_space_realign,
+            past_embeddings=past_embeddings,
             latent_only=request.latent_only,
-            temperature=request.temperature,
-            top_p=request.top_p,
         )
         
-        # Generate debug text with vLLM if enabled (faster than HF)
-        if use_vllm_for_debug:
-            sampling_params = SamplingParams(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                max_tokens=request.debug_max_tokens,
-            )
-            # Use same prompt with optional think token
-            vllm_prompt = f"{prompt}<think>" if request.add_think_token else prompt
-            outputs = vllm_engine.generate([vllm_prompt], sampling_params)
-            debug_text = outputs[0].outputs[0].text.strip() if outputs else ""
-        
-        # Store/update cache
+        # Store embeddings in cache
         if request.session_id:
-            cache_manager.update(request.session_id, new_past_kv)
+            cache_manager.update(request.session_id, latent_embeddings, actual_steps)
             session_id = request.session_id
         else:
-            session_id = cache_manager.create(new_past_kv)
+            session_id = cache_manager.create(latent_embeddings, actual_steps)
         
-        # Count debug text tokens
+        # Build content message with debug info
+        debug_text = ""
+        if request.debug_max_tokens and request.debug_max_tokens > 0:
+            generated_text = model_wrapper.generate_text_with_embeddings_for_api(
+                prompt,
+                latent_embeddings=past_embeddings,
+                vllm_engine=vllm_engine,
+                max_new_tokens=request.debug_max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                add_think_token=request.add_think_token,
+            )
+            debug_text = generated_text
+        
         debug_tokens = count_tokens(debug_text) if debug_text else 0
-        
-        # Build content message - now shows actual model continuation
-        if latent_steps is not None:
-            content = f"[Latent: {actual_steps} steps] {debug_text}"
-        else:
-            content = f"[Latent: dynamic {actual_steps} steps] {debug_text}"
+        content = f"[Latent: {actual_steps} steps] {debug_text}"
         
         return ChatCompletionResponse(
             id=response_id,
@@ -592,70 +563,45 @@ async def chat_completions(request: ChatCompletionRequest):
                 completion_tokens=actual_steps + debug_tokens,
                 total_tokens=prompt_tokens + actual_steps + debug_tokens,
                 latent_steps=actual_steps,
-                kv_cache_shape=get_kv_cache_shape(new_past_kv),
+                kv_cache_shape=list(latent_embeddings.shape),  # Now shows embedding shape [1, L, H]
             ),
             session_id=session_id,
         )
     
     elif request.mode == "text":
-        # Generate text using cached KV values, or vLLM for fresh generation
+        # Generate text using cached latent embeddings with vLLM
         
-        # Check if we should use vLLM path (no KV cache)
-        use_vllm_path = (
-            request.use_vllm 
-            and vllm_enabled 
-            and vllm_engine is not None 
-            and not request.session_id
-        )
-        
-        if use_vllm_path:
-            # vLLM fast path: no KV cache, pure text generation
-            sampling_params = SamplingParams(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                max_tokens=request.max_tokens,
-            )
-            vllm_prompt = f"{prompt}<think>" if request.add_think_token else prompt
-            outputs = vllm_engine.generate([vllm_prompt], sampling_params)
-            generated_text = outputs[0].outputs[0].text.strip() if outputs else ""
-            
-            completion_tokens = count_tokens(generated_text)
-            
-            return ChatCompletionResponse(
-                id=response_id,
-                model=request.model,
-                choices=[
-                    Choice(
-                        index=0,
-                        message=Message(role="assistant", content=generated_text),
-                    )
-                ],
-                usage=Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                ),
-                session_id=None,
+        # Hybrid mode requires vLLM to be enabled
+        if not vllm_enabled or vllm_engine is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Text mode requires vLLM to be enabled. Start server with --use_vllm flag."
             )
         
-        # Standard HuggingFace path with KV cache
+        # session_id is required for text mode (must have latent embeddings)
         if not request.session_id:
             raise HTTPException(
                 status_code=400,
-                detail="session_id is required for 'text' mode (or use use_vllm=true for fresh generation without cache)"
+                detail="session_id is required for 'text' mode. First call 'latent' mode to generate embeddings."
             )
         
         model_wrapper = get_model_wrapper()
-        past_kv = cache_manager.get(request.session_id, device=str(model_wrapper.device))
-        if past_kv is None:
+        
+        # Retrieve cached embeddings
+        cached_data = cache_manager.get(request.session_id, device=str(model_wrapper.device))
+        if cached_data is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Session '{request.session_id}' not found or expired"
             )
         
-        generated_text = model_wrapper.generate_text_for_api(
+        latent_embeddings = cached_data["embeddings"]
+        
+        # Generate text using vLLM with injected latent embeddings
+        generated_text = model_wrapper.generate_text_with_embeddings_for_api(
             prompt,
-            past_key_values=past_kv,
+            latent_embeddings=latent_embeddings,
+            vllm_engine=vllm_engine,
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
@@ -695,7 +641,7 @@ async def get_session_info(session_id: str):
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """Delete a session and its cached KV values."""
+    """Delete a session and its cached embeddings."""
     deleted = cache_manager.delete(session_id)
     return {"session_id": session_id, "deleted": deleted}
 
@@ -739,6 +685,21 @@ async def cleanup_memory():
         "memory_stats": memory_stats,
     }
 
+@app.get("/v1/sessions/{session_id}/embeddings")
+async def get_session_embeddings(session_id: str):
+    """Retrieve cached embeddings for a session."""
+    cached_data = cache_manager.get(session_id)
+    if cached_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' not found or expired"
+        )
+    
+    embeddings_shape = list(cached_data["embeddings"].shape)
+    return {
+        "session_id": session_id,
+        "embeddings_shape": embeddings_shape,
+    }
 
 @app.get("/health")
 async def health_check():
@@ -765,10 +726,12 @@ async def health_check():
         "vllm_info": vllm_info,
         "backends": {
             "normal_mode": "vllm" if vllm_enabled else "huggingface",
-            "latent_mode": "huggingface (latent) + vllm (debug)" if vllm_enabled else "huggingface",
-            "text_mode": "vllm (use_vllm=true, no session) or huggingface (with session)" if vllm_enabled else "huggingface",
+            "latent_mode": "huggingface (embeddings)" if vllm_enabled else "huggingface (requires --use_vllm)",
+            "text_mode": "vllm (with cached embeddings)" if vllm_enabled else "requires --use_vllm",
         },
-        "gpu_separation": {
+        "hybrid_mode": {
+            "enabled": vllm_enabled,
+            "description": "HF generates latent embeddings, vLLM uses them for text generation",
             "hf_gpus": list(model_wrappers.keys()),
             "vllm_isolated": vllm_enabled,
         },
