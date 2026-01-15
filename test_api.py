@@ -87,6 +87,8 @@ Now output your plan to solve the question below:"""
     print("\n=== After Planner Agent ===")
     cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
     print(f"Cache Embeddings Shape: {cache_embedding.json()}")
+    cache_kv = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/kv_cache")
+    print(f"KV Cache Size: {cache_kv.json()}")
     
     # Step 2: Critic agent
     print("\n[Step 2] Critic Agent - Latent (5 steps)")
@@ -128,6 +130,8 @@ Now, output your response below:"""
     print("\n=== After Critic Agent ===")
     cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
     print(f"Cache Embeddings Shape: {cache_embedding.json()}")
+    cache_kv = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/kv_cache")
+    print(f"KV Cache Size: {cache_kv.json()}")
     
     # Step 3: Refiner agent
     print("\n[Step 3] Refiner Agent - Latent (5 steps)")
@@ -166,7 +170,8 @@ Now, output your refined plan below:"""
     print("\n=== After Refiner Agent ===")
     cache_embedding = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/embeddings")
     print(f"Cache Embeddings Shape: {cache_embedding.json()}")
-        
+    cache_kv = requests.get(f"{BASE_URL}/v1/sessions/{session_id}/kv_cache")
+    print(f"KV Cache Size: {cache_kv.json()}")
     
     # Step 4: Judger agent - text generation
     print("\n[Step 4] Judger Agent - Text Generation")
@@ -1566,7 +1571,7 @@ def test_complex_task():
     print(f"Session ID: {result['session_id']}")
     print(f"Content: {result['choices'][0]['message']['content']}")
     print(f"Usage: {result['usage']}")
-    print(f"KV cache shape: {result['usage'].get('kv_cache_shape')}")
+    print(f"KV cache shape: {result['usage'].get('kv_cache')}")
     
     # Now use the session to generate final text
     print("\n[Text Generation] Using cached KV from dynamic latent")

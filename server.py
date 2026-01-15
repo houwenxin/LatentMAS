@@ -506,36 +506,40 @@ async def chat_completions(request: ChatCompletionRequest):
         
         model_wrapper = get_model_wrapper()
         
-        # Load existing embeddings if session_id provided (for accumulating across calls)
+        # Load existing embeddings and KV cache if session_id provided (for accumulating across calls)
         past_embeddings = None
+        past_kv = None
         if request.session_id:
             cached_data = cache_manager.get(request.session_id, device=str(model_wrapper.device))
             if cached_data is not None:
                 past_embeddings = cached_data["embeddings"]
+                past_kv = cached_data["past_kv"]  # OPTIMIZATION: reuse KV cache
         
         # Generate latent embeddings using HuggingFace
-        latent_embeddings, actual_steps, _ = model_wrapper.generate_latent_with_embeddings_for_api(
+        # When past_kv is available, this is O(new_tokens) instead of O(total_history)
+        latent_embeddings, actual_steps, _, new_past_kv = model_wrapper.generate_latent_with_embeddings_for_api(
             prompt,
             latent_steps=latent_steps,
             add_think_token=request.add_think_token,
             latent_space_realign=request.latent_space_realign,
             past_embeddings=past_embeddings,
+            past_kv=past_kv,
             latent_only=request.latent_only,
         )
         
-        # Store embeddings in cache
+        # Store embeddings and KV cache
         if request.session_id:
-            cache_manager.update(request.session_id, latent_embeddings, actual_steps)
+            cache_manager.update(request.session_id, latent_embeddings, actual_steps, past_kv=new_past_kv)
             session_id = request.session_id
         else:
-            session_id = cache_manager.create(latent_embeddings, actual_steps)
+            session_id = cache_manager.create(latent_embeddings, actual_steps, past_kv=new_past_kv)
         
         # Build content message with debug info
         debug_text = ""
         if request.debug_max_tokens and request.debug_max_tokens > 0:
             generated_text = model_wrapper.generate_text_with_embeddings_for_api(
                 prompt,
-                latent_embeddings=past_embeddings,
+                latent_embeddings=latent_embeddings,  # Use the new embeddings, not past
                 vllm_engine=vllm_engine,
                 max_new_tokens=request.debug_max_tokens,
                 temperature=request.temperature,
@@ -700,6 +704,30 @@ async def get_session_embeddings(session_id: str):
     return {
         "session_id": session_id,
         "embeddings_shape": embeddings_shape,
+    }
+# Get KV Cache Info
+@app.get("/v1/sessions/{session_id}/kv_cache")
+async def get_session_kv_cache(session_id: str):
+    """Retrieve cached KV cache info for a session."""
+    cached_data = cache_manager.get(session_id)
+    if cached_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' not found or expired"
+        )
+    
+    past_kv = cached_data.get("past_kv", None)
+    if past_kv is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' does not have KV cache stored"
+        )
+    
+    # KV cache is a tuple of tuples: ((layer1_key, layer1_value), (layer2_key, layer2_value), ...)
+    kv_cache_shape = past_kv[0][0].shape if past_kv else None
+    return {
+        "session_id": session_id,
+        "kv_cache_shape": kv_cache_shape,
     }
 
 @app.get("/health")

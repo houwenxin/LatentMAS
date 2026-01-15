@@ -1,9 +1,12 @@
 """
 Embedding Cache Manager for LatentMAS API
 
-Manages server-side storage of latent embeddings with TTL expiration.
+Manages server-side storage of latent embeddings and KV cache with TTL expiration.
 Used for hybrid vLLM + HuggingFace mode where HF generates latent embeddings
 and vLLM uses them for text generation.
+
+Optimization: Stores both embeddings (for vLLM text generation) and KV cache
+(for HF latent generation) to avoid reprocessing past context on each call.
 """
 
 import gc
@@ -26,16 +29,45 @@ def _move_tensor_to_device(tensor: torch.Tensor, device: Union[str, torch.device
     return tensor.to(device)
 
 
+def _move_kv_cache_to_device(
+    past_kv: Optional[Tuple], 
+    device: Union[str, torch.device]
+) -> Optional[Tuple]:
+    """Move KV cache tuple to specified device."""
+    if past_kv is None:
+        return None
+    
+    # Handle Cache objects (DynamicCache, etc.)
+    if Cache is not None and isinstance(past_kv, Cache):
+        # Convert to legacy format, move, then convert back
+        legacy = past_kv.to_legacy_cache()
+        moved_legacy = tuple(
+            tuple(t.to(device) for t in layer)
+            for layer in legacy
+        )
+        return past_kv.__class__.from_legacy_cache(moved_legacy)
+    
+    # Handle legacy tuple format: tuple of (key, value) tuples per layer
+    return tuple(
+        tuple(t.to(device) for t in layer)
+        for layer in past_kv
+    )
+
+
 class EmbeddingCacheManager:
     """
-    Thread-safe in-memory cache manager for latent embeddings.
+    Thread-safe in-memory cache manager for latent embeddings and KV cache.
     
     Each session stores:
-    - embeddings: The latent embedding tensor [1, L, H]
+    - embeddings: The latent embedding tensor [1, L, H] (for vLLM text generation)
+    - past_kv: HuggingFace KV cache tuple (for efficient latent generation)
     - shape: Shape of the embeddings for debugging
     - latent_steps: Number of latent steps taken
     - created_at: Timestamp for TTL management
     - last_accessed: Last access timestamp
+    
+    The KV cache is stored on CPU to save GPU memory and moved to GPU on access.
+    This avoids reprocessing all past embeddings on each latent call.
     """
     
     def __init__(self, ttl_seconds: int = 1800, cleanup_interval: int = 1800):
@@ -96,15 +128,17 @@ class EmbeddingCacheManager:
         self, 
         embeddings: torch.Tensor, 
         latent_steps: int,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        past_kv: Optional[Tuple] = None,
     ) -> str:
         """
-        Create a new cache entry for latent embeddings.
+        Create a new cache entry for latent embeddings and KV cache.
         
         Args:
             embeddings: The latent embeddings tensor [1, L, H] (will be moved to CPU)
             latent_steps: Number of latent steps taken
             session_id: Optional custom session ID. If None, UUID is generated.
+            past_kv: Optional HuggingFace KV cache tuple (will be moved to CPU)
             
         Returns:
             The session ID
@@ -112,14 +146,16 @@ class EmbeddingCacheManager:
         if session_id is None:
             session_id = str(uuid.uuid4())
         
-        # Move embeddings to CPU to save GPU memory
+        # Move embeddings and KV cache to CPU to save GPU memory
         embeddings_cpu = _move_tensor_to_device(embeddings, 'cpu')
+        past_kv_cpu = _move_kv_cache_to_device(past_kv, 'cpu')
         shape = list(embeddings_cpu.shape) if embeddings_cpu is not None else None
         
         now = time.time()
         with self._lock:
             self._cache[session_id] = {
                 "embeddings": embeddings_cpu,
+                "past_kv": past_kv_cpu,
                 "shape": shape,
                 "latent_steps": latent_steps,
                 "created_at": now,
@@ -134,16 +170,16 @@ class EmbeddingCacheManager:
         device: Union[str, torch.device] = 'cuda:0'
     ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve embeddings by session ID and migrate to target device.
+        Retrieve embeddings and KV cache by session ID and migrate to target device.
         
         Updates last_accessed timestamp on access.
         
         Args:
             session_id: Session identifier
-            device: Target device to move embeddings to (default: 'cuda:0')
+            device: Target device to move tensors to (default: 'cuda:0')
         
         Returns:
-            Dict with 'embeddings', 'shape', 'latent_steps' or None if not found/expired
+            Dict with 'embeddings', 'past_kv', 'shape', 'latent_steps' or None if not found/expired
         """
         with self._lock:
             entry = self._cache.get(session_id)
@@ -158,14 +194,17 @@ class EmbeddingCacheManager:
             # Update access time
             entry["last_accessed"] = time.time()
             embeddings_cpu = entry["embeddings"]
+            past_kv_cpu = entry["past_kv"]
             shape = entry["shape"]
             latent_steps = entry["latent_steps"]
         
         # Migrate from CPU to GPU (outside lock to avoid blocking other operations)
         embeddings_gpu = _move_tensor_to_device(embeddings_cpu, device)
+        past_kv_gpu = _move_kv_cache_to_device(past_kv_cpu, device)
         
         return {
             "embeddings": embeddings_gpu,
+            "past_kv": past_kv_gpu,
             "shape": shape,
             "latent_steps": latent_steps,
         }
@@ -174,7 +213,8 @@ class EmbeddingCacheManager:
         self, 
         session_id: str, 
         embeddings: torch.Tensor,
-        latent_steps: int
+        latent_steps: int,
+        past_kv: Optional[Tuple] = None,
     ) -> bool:
         """
         Update existing cache entry.
@@ -182,12 +222,14 @@ class EmbeddingCacheManager:
         Args:
             embeddings: The embeddings tensor to store (will be moved to CPU)
             latent_steps: Number of latent steps
+            past_kv: Optional HuggingFace KV cache tuple (will be moved to CPU)
         
         Returns:
             True if updated, False if session not found
         """
-        # Move embeddings to CPU to save GPU memory
+        # Move embeddings and KV cache to CPU to save GPU memory
         embeddings_cpu = _move_tensor_to_device(embeddings, 'cpu')
+        past_kv_cpu = _move_kv_cache_to_device(past_kv, 'cpu')
         shape = list(embeddings_cpu.shape) if embeddings_cpu is not None else None
         
         with self._lock:
@@ -195,6 +237,7 @@ class EmbeddingCacheManager:
                 return False
             
             self._cache[session_id]["embeddings"] = embeddings_cpu
+            self._cache[session_id]["past_kv"] = past_kv_cpu
             self._cache[session_id]["shape"] = shape
             self._cache[session_id]["latent_steps"] = latent_steps
             self._cache[session_id]["last_accessed"] = time.time()

@@ -694,24 +694,29 @@ class ModelWrapper:
         add_think_token: bool = False,
         latent_space_realign: bool = False,
         past_embeddings: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple] = None,
         embedding_insert_marker: str = "<|im_start|>user\n",
         latent_only: bool = False,
-    ) -> Tuple[torch.Tensor, int, List[int]]:
+    ) -> Tuple[torch.Tensor, int, List[int], Optional[Tuple]]:
         """
         Generate latent representations and return embeddings for hybrid vLLM mode.
         
         This method uses HuggingFace to generate latent hidden states, which can
-        later be injected into vLLM for text generation. Like text mode, it combines
-        past embeddings with current input embeddings before running through the model.
+        later be injected into vLLM for text generation.
+        
+        OPTIMIZATION: When past_kv is provided, we skip reprocessing past embeddings
+        and only process the new prompt tokens. This gives O(new_tokens) complexity
+        instead of O(total_history).
         
         Args:
             prompt: The text prompt (already formatted with chat template)
             latent_steps: Number of latent reasoning steps
             add_think_token: Whether to append <think> token
             latent_space_realign: Whether to apply latent space realignment
-            past_embeddings: Optional tensor of shape [1, L, H] from previous latent calls
-                            in the same session. These will be inserted into the prompt
-                            embeddings to CONDITION the new generation.
+            past_embeddings: Tensor of shape [1, L, H] from previous latent calls.
+                            Used when past_kv is not available.
+            past_kv: HuggingFace KV cache tuple from previous calls.
+                    When provided, past_embeddings are NOT reprocessed (only stored).
             embedding_insert_marker: String marker after which to insert past embeddings
             latent_only: If True, only return the latent step embeddings (exclude prompt embeddings)
             
@@ -722,6 +727,7 @@ class ModelWrapper:
                                 If latent_only=True: only new latent step embeddings
             - actual_steps: Number of NEW latent steps taken in this call
             - generated_token_ids: Raw token IDs decoded from latent steps (for debugging)
+            - past_kv: Updated HuggingFace KV cache for next call
         """
         if add_think_token:
             prompt = f"{prompt}<think>"
@@ -738,8 +744,38 @@ class ModelWrapper:
         embedding_layer = self.model.get_input_embeddings()
         input_embeddings = embedding_layer(input_ids)  # [1, L, H]
         
-        # If we have past embeddings, insert them into input embeddings (like text mode)
-        if past_embeddings is not None:
+        # OPTIMIZATION: If we have past_kv, use it directly instead of reprocessing past_embeddings
+        if past_kv is not None:
+            # We have KV cache - just process new prompt tokens
+            past_len = _past_length(past_kv)
+            
+            # Attention mask: past KV tokens + new input tokens
+            attention_mask = torch.ones(
+                (1, past_len + input_embeddings.shape[1]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            
+            # Forward pass with only new input, using cached KV
+            outputs = self.model(
+                inputs_embeds=input_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_kv,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = outputs.past_key_values
+            last_hidden = outputs.hidden_states[-1][:, -1, :]
+            
+            # For embedding record: past_embeddings already stored, just add new input
+            if not latent_only:
+                embedding_record = [past_embeddings.to(self.device), input_embeddings.detach()]
+            else:
+                embedding_record = []
+        
+        elif past_embeddings is not None:
+            # No KV cache but have past embeddings - must reprocess (slower path)
             past_embeddings = past_embeddings.to(self.device)
             
             # Find insertion point for past embeddings
@@ -754,36 +790,54 @@ class ModelWrapper:
             left_emb = input_embeddings[:, :insert_idx, :]
             right_emb = input_embeddings[:, insert_idx:, :]
             combined_input = torch.cat([left_emb, past_embeddings, right_emb], dim=1)
+            
+            attention_mask = torch.ones(
+                (1, combined_input.shape[1]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            
+            outputs = self.model(
+                inputs_embeds=combined_input,
+                attention_mask=attention_mask,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = outputs.past_key_values
+            last_hidden = outputs.hidden_states[-1][:, -1, :]
+            
+            if not latent_only:
+                embedding_record = [combined_input.detach()]
+            else:
+                embedding_record = []
+        
         else:
-            combined_input = input_embeddings
-        
-        # Create attention mask for combined input
-        attention_mask = torch.ones(
-            (1, combined_input.shape[1]),
-            dtype=torch.long,
-            device=self.device,
-        )
-        
-        # Initial forward pass with combined embeddings
-        outputs = self.model(
-            inputs_embeds=combined_input,
-            attention_mask=attention_mask,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        past = outputs.past_key_values
-        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
-        
-        # Start recording embeddings
-        # If latent_only, we only record latent step embeddings (not input)
-        embedding_record: List[torch.Tensor] = []
-        if not latent_only:
-            embedding_record.append(combined_input.detach())
+            # No past context - fresh start
+            attention_mask = torch.ones(
+                (1, input_embeddings.shape[1]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            
+            outputs = self.model(
+                inputs_embeds=input_embeddings,
+                attention_mask=attention_mask,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = outputs.past_key_values
+            last_hidden = outputs.hidden_states[-1][:, -1, :]
+            
+            if not latent_only:
+                embedding_record = [input_embeddings.detach()]
+            else:
+                embedding_record = []
         
         generated_tokens: List[int] = []
         
-        for step in range(latent_steps):
+        for step in range(latent_steps):      
             # Apply latent realignment
             latent_vec = self._apply_latent_realignment(last_hidden, self.model, latent_space_realign)
             latent_embed = latent_vec.unsqueeze(1)  # [B, 1, H]
@@ -809,10 +863,14 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
         
-        # Concatenate all embeddings: [combined_input + latent_steps]
-        latent_embeddings = torch.cat(embedding_record, dim=1)
+        # Concatenate all embeddings
+        if embedding_record:
+            latent_embeddings = torch.cat(embedding_record, dim=1)
+        else:
+            # latent_only with no latent steps
+            latent_embeddings = torch.empty(1, 0, input_embeddings.shape[-1], device=self.device)
         
-        return latent_embeddings, latent_steps, generated_tokens
+        return latent_embeddings, latent_steps, generated_tokens, past
 
     @torch.no_grad()
     def generate_text_with_embeddings_for_api(
