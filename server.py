@@ -367,6 +367,7 @@ async def lifespan(app: FastAPI):
                     max_model_len=args.vllm_max_model_len,
                     trust_remote_code=True,
                     enable_prompt_embeds=True,  # Required for hybrid mode with latent embeddings
+                    enable_prefix_caching=True,  # Improve performance with cached KV
                 )
                 vllm_enabled = True
                 print(f"[API] vLLM engine loaded successfully on GPUs: {vllm_gpu_indices}")
@@ -513,7 +514,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 past_embeddings = cached_data["embeddings"]
         
         # Generate latent embeddings using HuggingFace
-        latent_embeddings, actual_steps, raw_token_ids = model_wrapper.generate_latent_with_embeddings_for_api(
+        latent_embeddings, actual_steps, _ = model_wrapper.generate_latent_with_embeddings_for_api(
             prompt,
             latent_steps=latent_steps,
             add_think_token=request.add_think_token,

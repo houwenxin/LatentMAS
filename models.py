@@ -781,16 +781,9 @@ class ModelWrapper:
         if not latent_only:
             embedding_record.append(combined_input.detach())
         
-        # Get lm_head for token decoding (debugging)
-        lm_head = self.model.lm_head if hasattr(self.model, 'lm_head') else self.model.get_output_embeddings()
         generated_tokens: List[int] = []
         
         for step in range(latent_steps):
-            # Decode token from current hidden state (for debugging)
-            logits = lm_head(last_hidden)
-            token_id = logits.argmax(dim=-1)[0].item()
-            generated_tokens.append(token_id)
-            
             # Apply latent realignment
             latent_vec = self._apply_latent_realignment(last_hidden, self.model, latent_space_realign)
             latent_embed = latent_vec.unsqueeze(1)  # [B, 1, H]
