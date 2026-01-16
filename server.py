@@ -539,7 +539,7 @@ async def chat_completions(request: ChatCompletionRequest):
         if request.debug_max_tokens and request.debug_max_tokens > 0:
             generated_text = model_wrapper.generate_text_with_embeddings_for_api(
                 prompt,
-                latent_embeddings=latent_embeddings,  # Use the new embeddings, not past
+                latent_embeddings=past_embeddings,
                 vllm_engine=vllm_engine,
                 max_new_tokens=request.debug_max_tokens,
                 temperature=request.temperature,
